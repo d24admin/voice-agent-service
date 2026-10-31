@@ -79,12 +79,21 @@ class CallSession:
         self._stt = SimulatedSTT()
         self._silence_timer: asyncio.Task[None] | None = None
         self._active_turn_task: asyncio.Task[None] | None = None
+        self._current_turn_id: int | None = None
+        self._retiring_turns: set[asyncio.Task[None]] = set()
+        self._retire_queue: asyncio.Queue[asyncio.Task[None]] = asyncio.Queue(
+            maxsize=settings.outbound_lifecycle_capacity
+        )
         self._turns: dict[int, TurnState] = {}
         self._next_turn_id = 1
 
     @property
     def turns(self) -> dict[int, TurnState]:
         return dict(self._turns)
+
+    @property
+    def retiring_turn_count(self) -> int:
+        return len(self._retiring_turns)
 
     async def run(self) -> None:
         prefix = f"voice-session-{self.session_id}:"
@@ -100,7 +109,7 @@ class CallSession:
         )
         close_code = 1000
         try:
-            await orchestrator
+            await self._wait_for_session_end(receiver, writer, orchestrator)
         except asyncio.CancelledError:
             close_code = 1001
             raise
@@ -118,6 +127,27 @@ class CallSession:
             await self._outbound.close()
             await asyncio.gather(*owned, return_exceptions=True)
             await self._transport.close(close_code)
+
+    async def _wait_for_session_end(
+        self,
+        receiver: asyncio.Task[None],
+        writer: asyncio.Task[None],
+        orchestrator: asyncio.Task[None],
+    ) -> None:
+        watched = {receiver, writer, orchestrator}
+        while watched:
+            done, _ = await asyncio.wait(
+                watched, return_when=asyncio.FIRST_COMPLETED
+            )
+            if orchestrator in done:
+                await orchestrator
+                return
+            if writer in done:
+                await writer
+                raise RuntimeError("outbound writer stopped unexpectedly")
+            if receiver in done:
+                await receiver
+                watched.remove(receiver)
 
     async def _receive_loop(self) -> None:
         while True:
@@ -172,6 +202,7 @@ class CallSession:
     async def _handle_audio_frame(
         self, event: AudioFrame, received_ns: int
     ) -> None:
+        self._interrupt_for_barge_in()
         partial = self._stt.accept_frame(event.text, received_ns)
         await self._cancel_silence_timer()
         self._silence_timer = asyncio.create_task(
@@ -222,6 +253,10 @@ class CallSession:
             turn_id=turn_id,
             metrics=TurnMetrics(turn_id=turn_id, baseline_ns=final.last_frame_ns),
         )
+        turn.lifecycle_reservation = await self._outbound.reserve_turn(
+            turn_id,
+            self._settings.backpressure_timeout_ms / 1_000,
+        )
         self._turns[turn_id] = turn
         self._session_metrics.mark_started(turn_id)
         runner = ActiveTurnRunner(
@@ -234,6 +269,34 @@ class CallSession:
         self._active_turn_task = asyncio.create_task(
             runner.run(turn, (ChatMessage(role="user", content=final.text),)),
             name=f"voice-session-{self.session_id}:turn-{turn_id}",
+        )
+        self._current_turn_id = turn_id
+
+    def _interrupt_for_barge_in(self) -> None:
+        turn_id = self._current_turn_id
+        if turn_id is None:
+            return
+        turn = self._turns[turn_id]
+        if not (turn.generation_open or turn.playback_open):
+            return
+        if not turn.interrupt("barge_in"):
+            return
+
+        task = self._active_turn_task
+        if task is not None and not task.done():
+            task.cancel()
+            self._retiring_turns.add(task)
+            self._retire_queue.put_nowait(task)
+        reservation = turn.lifecycle_reservation
+        if reservation is None:
+            raise RuntimeError("active turn has no lifecycle reservation")
+        self._outbound.put_lifecycle_nowait(
+            reservation,
+            TerminalCommand(
+                turn_id=turn.turn_id,
+                outcome=TurnOutcome.INTERRUPTED,
+                reason="barge_in",
+            ),
         )
 
     async def _write_loop(self) -> None:
@@ -262,6 +325,7 @@ class CallSession:
             event = self._terminal_event(turn)
             await self._transport.send(event)
             self._session_metrics.record_turn(turn.metrics)
+            turn.playback_open = False
             await self._outbound.ack(action)
             return
 
@@ -293,6 +357,8 @@ class CallSession:
         )
         await self._transport.send(event)
         self._session_metrics.record_turn(turn.metrics)
+        if self._current_turn_id == turn.turn_id:
+            self._current_turn_id = None
         reservation = turn.lifecycle_reservation
         if reservation is not None:
             await self._outbound.ack(
@@ -318,7 +384,27 @@ class CallSession:
         return turn is not None and turn.output_valid
 
     async def _turn_reaper(self) -> None:
-        await asyncio.Event().wait()
+        while True:
+            task = await self._retire_queue.get()
+            try:
+                done, _ = await asyncio.wait(
+                    {task},
+                    timeout=self._settings.cancellation_timeout_ms / 1_000,
+                )
+                if task not in done:
+                    self._session_metrics.timeout_count += 1
+                    task.cancel()
+                    await task
+                else:
+                    task.result()
+            except asyncio.CancelledError:
+                if not task.done():
+                    raise
+            except BaseException:
+                pass
+            finally:
+                if task.done():
+                    self._retiring_turns.discard(task)
 
     @staticmethod
     def _event_id() -> str:
