@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 from app.clock import Clock
 from app.config import Settings
-from app.events import (
+from app.api.events import (
     AudioChunk,
     AudioEnd,
     AudioFrame,
@@ -36,7 +36,11 @@ from app.conversation.outbound_buffer import (
 )
 from app.providers.llm import ChatMessage, LLMProvider
 from app.providers.stt import FinalResult, SimulatedSTT
-from app.transport import EventTransport, ProtocolError, TransportDisconnected
+from app.api.websocket_transport import (
+    EventTransport,
+    ProtocolError,
+    TransportDisconnected,
+)
 from app.conversation.turn_pipeline import ActiveTurnRunner
 from app.conversation.turn_state import TurnState
 

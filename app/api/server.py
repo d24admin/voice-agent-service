@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -10,10 +9,14 @@ from pydantic import BaseModel
 
 from app.clock import Clock, SystemClock
 from app.config import Settings
+from app.conversation.call_session import CallSession
+from app.conversation.session_manager import SessionManager
 from app.metrics import MetricsRegistry
 from app.providers.llm import LLMProvider, MockLLMProvider
-from app.conversation.call_session import CallSession
-from app.transport import TransportDisconnected, WebSocketEventTransport
+from app.api.websocket_transport import (
+    TransportDisconnected,
+    WebSocketEventTransport,
+)
 
 
 ProviderFactory = Callable[[str], LLMProvider]
@@ -22,35 +25,6 @@ ProviderFactory = Callable[[str], LLMProvider]
 class HealthResponse(BaseModel):
     status: str
     service: str
-
-
-class SessionManager:
-    def __init__(self) -> None:
-        self._sessions: dict[str, CallSession] = {}
-
-    def register(self, session: CallSession) -> None:
-        if session.session_id in self._sessions:
-            raise ValueError(f"session already registered: {session.session_id}")
-        self._sessions[session.session_id] = session
-
-    def unregister(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
-
-    async def close_all(self, timeout_s: float) -> None:
-        sessions = tuple(self._sessions.values())
-        if not sessions:
-            return
-        try:
-            async with asyncio.timeout(timeout_s):
-                await asyncio.gather(
-                    *(session.request_shutdown() for session in sessions)
-                )
-                await asyncio.gather(*(session.wait_closed() for session in sessions))
-        except TimeoutError:
-            for session in sessions:
-                session.force_cancel()
-        finally:
-            self._sessions.clear()
 
 
 def create_app(

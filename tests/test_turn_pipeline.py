@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Sequence
 import pytest
 
 from app.config import Settings
-from app.events import AudioChunk, LLMToken
+from app.api.events import AudioChunk, LLMToken
 from app.metrics import TurnMetrics, TurnOutcome
 from app.conversation.outbound_buffer import (
     OutboundBuffer,

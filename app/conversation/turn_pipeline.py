@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from app.clock import Clock, SystemClock
 from app.config import Settings
-from app.events import AudioChunk, LLMToken
+from app.api.events import AudioChunk, LLMToken
 from app.conversation.outbound_buffer import OutboundBuffer, TerminalCommand
 from app.conversation.turn_state import TurnState
 from app.providers.llm import ChatMessage, LLMProvider

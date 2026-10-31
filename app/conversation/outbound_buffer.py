@@ -5,7 +5,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from app.events import ServerEvent
+from app.api.events import ServerEvent
 from app.metrics import TurnOutcome
 
 

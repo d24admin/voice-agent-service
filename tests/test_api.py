@@ -11,11 +11,12 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.clock import SystemClock
 from app.config import Settings
-from app.events import AudioEnd, AudioFrame, SessionStart, SessionStop
-from app.main import SessionManager, create_app
+from app.api.events import AudioEnd, AudioFrame, SessionStart, SessionStop
+from app.api.server import create_app
 from app.metrics import TurnMetrics, TurnOutcome
 from app.providers.llm import ChatMessage
 from app.conversation.call_session import CallSession
+from app.conversation.session_manager import SessionManager
 from tests.conftest import FakeTransport, event_fields, live_session_tasks
 
 

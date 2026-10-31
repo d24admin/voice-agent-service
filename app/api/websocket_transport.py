@@ -7,7 +7,7 @@ from typing import Protocol
 from pydantic import ValidationError
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from app.events import ClientEvent, ServerEvent, parse_client_event
+from app.api.events import ClientEvent, ServerEvent, parse_client_event
 
 
 class EventTransport(Protocol):

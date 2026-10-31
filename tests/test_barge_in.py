@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Sequence
 
 import pytest
 
-from app.events import (
+from app.api.events import (
     AudioChunk,
     AudioEnd,
     AudioFrame,

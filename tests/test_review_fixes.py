@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Sequence
 import pytest
 
 from app.clock import SystemClock
-from app.events import AudioEnd, AudioFrame, SessionStart, SessionStop, TurnFailed
+from app.api.events import AudioEnd, AudioFrame, SessionStart, SessionStop, TurnFailed
 from app.metrics import MetricsRegistry, TurnOutcome
 from app.providers.llm import ChatMessage
 from app.conversation.call_session import CallSession

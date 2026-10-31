@@ -6,7 +6,7 @@ import pytest
 
 from app.clock import SystemClock
 from app.config import Settings
-from app.events import (
+from app.api.events import (
     AudioChunk,
     AudioEnd,
     AudioFrame,

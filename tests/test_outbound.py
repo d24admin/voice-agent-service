@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.events import AudioChunk, LLMToken, Ping, TranscriptFinal
+from app.api.events import AudioChunk, LLMToken, Ping, TranscriptFinal
 from app.metrics import TurnOutcome
 from app.conversation.outbound_buffer import (
     DropAction,

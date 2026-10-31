@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.config import Settings
-from app.events import (
+from app.api.events import (
     AudioEnd,
     AudioFrame,
     LLMToken,

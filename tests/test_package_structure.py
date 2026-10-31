@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
+
+from fastapi import FastAPI
+
 
 def test_provider_modules_are_grouped() -> None:
     from app.providers.llm import ChatMessage, LLMProvider, MockLLMProvider
@@ -27,3 +31,28 @@ def test_conversation_modules_are_grouped() -> None:
     assert ActiveTurnRunner.__module__ == "app.conversation.turn_pipeline"
     assert TurnState.__module__ == "app.conversation.turn_state"
     assert TurnOutcome is MetricsTurnOutcome
+
+
+def test_api_modules_are_grouped_and_flat_modules_removed() -> None:
+    from app.api.events import SessionStart, parse_client_event
+    from app.api.server import create_app
+    from app.api.websocket_transport import WebSocketEventTransport
+    from app.conversation.session_manager import SessionManager
+
+    assert isinstance(create_app(), FastAPI)
+    assert SessionStart.__module__ == "app.api.events"
+    assert parse_client_event.__module__ == "app.api.events"
+    assert WebSocketEventTransport.__module__ == "app.api.websocket_transport"
+    assert SessionManager.__module__ == "app.conversation.session_manager"
+
+    for removed_module in (
+        "app.events",
+        "app.main",
+        "app.outbound",
+        "app.session",
+        "app.stt",
+        "app.transport",
+        "app.tts",
+        "app.turn",
+    ):
+        assert importlib.util.find_spec(removed_module) is None

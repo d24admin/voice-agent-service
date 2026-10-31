@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
-from app.events import ClientEvent, ServerEvent
+from app.api.events import ClientEvent, ServerEvent
 
 
 class FakeTransport:
