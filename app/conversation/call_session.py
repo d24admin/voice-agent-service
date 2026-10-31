@@ -26,7 +26,7 @@ from app.events import (
     TurnInterrupted,
 )
 from app.metrics import MetricsRegistry, SessionMetrics, TurnMetrics, TurnOutcome
-from app.outbound import (
+from app.conversation.outbound_buffer import (
     DropAction,
     OutboundBuffer,
     OutboundClosedError,
@@ -37,7 +37,8 @@ from app.outbound import (
 from app.providers.llm import ChatMessage, LLMProvider
 from app.providers.stt import FinalResult, SimulatedSTT
 from app.transport import EventTransport, ProtocolError, TransportDisconnected
-from app.turn import ActiveTurnRunner, TurnState
+from app.conversation.turn_pipeline import ActiveTurnRunner
+from app.conversation.turn_state import TurnState
 
 
 @dataclass(frozen=True, slots=True)

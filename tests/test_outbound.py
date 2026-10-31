@@ -4,7 +4,7 @@ import pytest
 
 from app.events import AudioChunk, LLMToken, Ping, TranscriptFinal
 from app.metrics import TurnOutcome
-from app.outbound import (
+from app.conversation.outbound_buffer import (
     DropAction,
     OutboundBuffer,
     SendAction,

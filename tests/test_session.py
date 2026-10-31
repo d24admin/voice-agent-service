@@ -19,7 +19,7 @@ from app.events import (
 )
 from app.metrics import MetricsRegistry
 from app.providers.llm import MockLLMProvider
-from app.session import CallSession
+from app.conversation.call_session import CallSession
 from tests.conftest import FakeTransport, event_fields, live_session_tasks
 
 

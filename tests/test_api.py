@@ -15,7 +15,7 @@ from app.events import AudioEnd, AudioFrame, SessionStart, SessionStop
 from app.main import SessionManager, create_app
 from app.metrics import TurnMetrics, TurnOutcome
 from app.providers.llm import ChatMessage
-from app.session import CallSession
+from app.conversation.call_session import CallSession
 from tests.conftest import FakeTransport, event_fields, live_session_tasks
 
 

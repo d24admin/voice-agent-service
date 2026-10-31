@@ -9,7 +9,7 @@ from app.clock import SystemClock
 from app.events import AudioEnd, AudioFrame, SessionStart, SessionStop, TurnFailed
 from app.metrics import MetricsRegistry, TurnOutcome
 from app.providers.llm import ChatMessage
-from app.session import CallSession
+from app.conversation.call_session import CallSession
 from tests.conftest import FakeTransport, event_fields, live_session_tasks
 from tests.test_session import settings, start
 

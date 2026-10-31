@@ -8,14 +8,15 @@ import pytest
 from app.config import Settings
 from app.events import AudioChunk, LLMToken
 from app.metrics import TurnMetrics, TurnOutcome
-from app.outbound import (
+from app.conversation.outbound_buffer import (
     OutboundBuffer,
     OutputCompleteAction,
     SendAction,
     TerminalCommand,
 )
 from app.providers.llm import ChatMessage
-from app.turn import ActiveTurnRunner, TurnState
+from app.conversation.turn_pipeline import ActiveTurnRunner
+from app.conversation.turn_state import TurnState
 
 
 MESSAGES = (ChatMessage(role="user", content="hello"),)

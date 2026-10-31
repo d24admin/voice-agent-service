@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from app.metrics import MetricsRegistry, SessionMetrics, TurnMetrics, nearest_rank
-from app.turn import TurnOutcome, TurnState
+from app.conversation.turn_state import TurnOutcome, TurnState
 
 
 class FakeClock:
