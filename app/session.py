@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.clock import Clock
 from app.config import Settings
@@ -11,6 +12,7 @@ from app.events import (
     AudioEnd,
     AudioFrame,
     ClientEvent,
+    ErrorEvent,
     LLMToken,
     Pong,
     ServerEvent,
@@ -34,7 +36,7 @@ from app.outbound import (
 )
 from app.providers import ChatMessage, LLMProvider
 from app.stt import FinalResult, SimulatedSTT
-from app.transport import EventTransport
+from app.transport import EventTransport, ProtocolError, TransportDisconnected
 from app.turn import ActiveTurnRunner, TurnState
 
 
@@ -49,7 +51,25 @@ class SilenceExpired:
     timer_generation: int
 
 
-InboundMessage = InboundEnvelope | SilenceExpired
+@dataclass(slots=True)
+class ProtocolIssue:
+    code: str
+    message: str
+    fatal: bool
+    close_code: int | None
+    emit_error: bool
+    delivered: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass(frozen=True, slots=True)
+class ShutdownRequested:
+    close_code: int = 1000
+
+
+InboundMessage = InboundEnvelope | SilenceExpired | ProtocolIssue | ShutdownRequested
+
+
+logger = logging.getLogger("voice_agent")
 
 
 class CallSession:
@@ -86,6 +106,12 @@ class CallSession:
         )
         self._turns: dict[int, TurnState] = {}
         self._next_turn_id = 1
+        self._protocol_state = "awaiting_start"
+        self._requested_close_code = 1000
+        self._delivery_waiters: dict[str, asyncio.Event] = {}
+        self._terminal_delivery: dict[int, asyncio.Event] = {}
+        self._closed = asyncio.Event()
+        self._run_task: asyncio.Task[None] | None = None
 
     @property
     def turns(self) -> dict[int, TurnState]:
@@ -95,7 +121,20 @@ class CallSession:
     def retiring_turn_count(self) -> int:
         return len(self._retiring_turns)
 
+    async def request_shutdown(self) -> None:
+        if self._closed.is_set():
+            return
+        await self._inbound.put(ShutdownRequested())
+
+    async def wait_closed(self) -> None:
+        await self._closed.wait()
+
+    def force_cancel(self) -> None:
+        if self._run_task is not None and not self._run_task.done():
+            self._run_task.cancel()
+
     async def run(self) -> None:
+        self._run_task = asyncio.current_task()
         prefix = f"voice-session-{self.session_id}:"
         receiver = asyncio.create_task(
             self._receive_loop(), name=f"{prefix}receiver"
@@ -107,7 +146,7 @@ class CallSession:
         orchestrator = asyncio.create_task(
             self._orchestrate(), name=f"{prefix}orchestrator"
         )
-        close_code = 1000
+        close_code = self._requested_close_code
         try:
             await self._wait_for_session_end(receiver, writer, orchestrator)
         except asyncio.CancelledError:
@@ -117,6 +156,8 @@ class CallSession:
             close_code = 1011
             raise
         finally:
+            if close_code == 1000:
+                close_code = self._requested_close_code
             await self._cancel_silence_timer()
             owned = [receiver, writer, reaper, orchestrator]
             if self._active_turn_task is not None:
@@ -127,6 +168,12 @@ class CallSession:
             await self._outbound.close()
             await asyncio.gather(*owned, return_exceptions=True)
             await self._transport.close(close_code)
+            self._closed.set()
+            logger.info(
+                "session_closed session_id=%s close_code=%s",
+                self.session_id,
+                close_code,
+            )
 
     async def _wait_for_session_end(
         self,
@@ -151,18 +198,73 @@ class CallSession:
 
     async def _receive_loop(self) -> None:
         while True:
-            event = await self._transport.receive()
+            try:
+                event = await self._transport.receive()
+            except ProtocolError as exc:
+                issue = ProtocolIssue(
+                    code=exc.code,
+                    message=exc.safe_message,
+                    fatal=exc.fatal,
+                    close_code=exc.close_code,
+                    emit_error=exc.emit_error,
+                )
+                await self._put_inbound(issue, apply_backpressure=False)
+                if exc.fatal:
+                    return
+                continue
+            except TransportDisconnected:
+                await self._put_inbound(
+                    ShutdownRequested(close_code=1001),
+                    apply_backpressure=False,
+                )
+                return
             envelope = InboundEnvelope(
                 event=event,
                 received_ns=self._clock.monotonic_ns(),
             )
-            await self._inbound.put(envelope)
+            accepted = await self._put_inbound(envelope, apply_backpressure=True)
+            if not accepted:
+                return
             if isinstance(event, SessionStop):
                 return
+
+    async def _put_inbound(
+        self, message: InboundMessage, *, apply_backpressure: bool
+    ) -> bool:
+        if not apply_backpressure:
+            await self._inbound.put(message)
+            return True
+        try:
+            async with asyncio.timeout(
+                self._settings.backpressure_timeout_ms / 1_000
+            ):
+                await self._inbound.put(message)
+            return True
+        except TimeoutError:
+            self._session_metrics.overload_count += 1
+            await self._inbound.put(
+                ProtocolIssue(
+                    code="overloaded",
+                    message="inbound event queue is overloaded",
+                    fatal=True,
+                    close_code=1013,
+                    emit_error=True,
+                )
+            )
+            return False
 
     async def _orchestrate(self) -> None:
         while True:
             message = await self._inbound.get()
+            if isinstance(message, ShutdownRequested):
+                self._requested_close_code = message.close_code
+                await self._end_current_turn("session_ended")
+                return
+            if isinstance(message, ProtocolIssue):
+                await self._handle_protocol_issue(message)
+                if message.fatal:
+                    return
+                continue
             if isinstance(message, SilenceExpired):
                 final = self._stt.finalize(message.timer_generation)
                 if final is not None:
@@ -170,26 +272,12 @@ class CallSession:
                 continue
 
             event = message.event
-            if isinstance(event, SessionStop):
-                return
-            if isinstance(event, SessionStart):
-                await self._outbound.put_data(
-                    SessionReady(
-                        event_id=self._event_id(),
-                        session_id=self.session_id,
-                        timestamp=self._clock.utc_now(),
-                    )
+            if event.session_id != self.session_id:
+                await self._fatal_policy(
+                    "session_id_mismatch",
+                    "event session_id does not match the connection",
                 )
-                continue
-            if isinstance(event, AudioFrame):
-                await self._handle_audio_frame(event, message.received_ns)
-                continue
-            if isinstance(event, AudioEnd):
-                await self._cancel_silence_timer()
-                final = self._stt.finalize()
-                if final is not None:
-                    await self._start_turn(final)
-                continue
+                return
             if event.type == "ping":
                 await self._outbound.put_data(
                     Pong(
@@ -198,6 +286,82 @@ class CallSession:
                         timestamp=self._clock.utc_now(),
                     )
                 )
+                continue
+            if isinstance(event, SessionStart):
+                if self._protocol_state != "awaiting_start":
+                    await self._fatal_policy(
+                        "duplicate_start",
+                        "session.start is only valid once",
+                    )
+                    return
+                self._protocol_state = "active"
+                await self._outbound.put_data(
+                    SessionReady(
+                        event_id=self._event_id(),
+                        session_id=self.session_id,
+                        timestamp=self._clock.utc_now(),
+                    )
+                )
+                logger.info("session_started session_id=%s", self.session_id)
+                continue
+            if isinstance(event, SessionStop):
+                self._protocol_state = "closing"
+                await self._end_current_turn("session_ended")
+                return
+            if self._protocol_state != "active":
+                await self._fatal_policy(
+                    "invalid_state",
+                    "audio events require an active session",
+                )
+                return
+            if isinstance(event, AudioFrame):
+                await self._handle_audio_frame(event, message.received_ns)
+                continue
+            if isinstance(event, AudioEnd):
+                await self._cancel_silence_timer()
+                final = self._stt.finalize()
+                if final is not None:
+                    await self._start_turn(final, baseline_ns=message.received_ns)
+                continue
+
+    async def _handle_protocol_issue(self, issue: ProtocolIssue) -> None:
+        if issue.emit_error:
+            event = ErrorEvent(
+                event_id=self._event_id(),
+                session_id=self.session_id,
+                timestamp=self._clock.utc_now(),
+                code=issue.code,
+                message=issue.message,
+                fatal=issue.fatal,
+            )
+            if issue.fatal:
+                self._delivery_waiters[event.event_id] = issue.delivered
+            await self._outbound.put_data(event)
+            if issue.fatal:
+                try:
+                    async with asyncio.timeout(
+                        self._settings.backpressure_timeout_ms / 1_000
+                    ):
+                        await issue.delivered.wait()
+                except TimeoutError:
+                    pass
+                finally:
+                    self._delivery_waiters.pop(event.event_id, None)
+        if issue.fatal:
+            self._protocol_state = "closing"
+            self._requested_close_code = issue.close_code or 1008
+            await self._end_current_turn("session_ended")
+
+    async def _fatal_policy(self, code: str, message: str) -> None:
+        await self._handle_protocol_issue(
+            ProtocolIssue(
+                code=code,
+                message=message,
+                fatal=True,
+                close_code=1008,
+                emit_error=True,
+            )
+        )
 
     async def _handle_audio_frame(
         self, event: AudioFrame, received_ns: int
@@ -237,7 +401,9 @@ class CallSession:
         timer.cancel()
         await asyncio.gather(timer, return_exceptions=True)
 
-    async def _start_turn(self, final: FinalResult) -> None:
+    async def _start_turn(
+        self, final: FinalResult, baseline_ns: int | None = None
+    ) -> None:
         await self._outbound.put_data(
             TranscriptFinal(
                 event_id=self._event_id(),
@@ -251,7 +417,10 @@ class CallSession:
         self._next_turn_id += 1
         turn = TurnState(
             turn_id=turn_id,
-            metrics=TurnMetrics(turn_id=turn_id, baseline_ns=final.last_frame_ns),
+            metrics=TurnMetrics(
+                turn_id=turn_id,
+                baseline_ns=final.last_frame_ns if baseline_ns is None else baseline_ns,
+            ),
         )
         turn.lifecycle_reservation = await self._outbound.reserve_turn(
             turn_id,
@@ -271,16 +440,24 @@ class CallSession:
             name=f"voice-session-{self.session_id}:turn-{turn_id}",
         )
         self._current_turn_id = turn_id
+        logger.info(
+            "turn_started session_id=%s turn_id=%s",
+            self.session_id,
+            turn_id,
+        )
 
     def _interrupt_for_barge_in(self) -> None:
+        self._interrupt_current("barge_in")
+
+    def _interrupt_current(self, reason: str) -> TurnState | None:
         turn_id = self._current_turn_id
         if turn_id is None:
-            return
+            return None
         turn = self._turns[turn_id]
         if not (turn.generation_open or turn.playback_open):
-            return
-        if not turn.interrupt("barge_in"):
-            return
+            return None
+        if not turn.interrupt(reason):
+            return None
 
         task = self._active_turn_task
         if task is not None and not task.done():
@@ -290,14 +467,29 @@ class CallSession:
         reservation = turn.lifecycle_reservation
         if reservation is None:
             raise RuntimeError("active turn has no lifecycle reservation")
+        self._terminal_delivery[turn.turn_id] = asyncio.Event()
         self._outbound.put_lifecycle_nowait(
             reservation,
             TerminalCommand(
                 turn_id=turn.turn_id,
                 outcome=TurnOutcome.INTERRUPTED,
-                reason="barge_in",
+                reason=reason,
             ),
         )
+        return turn
+
+    async def _end_current_turn(self, reason: str) -> None:
+        turn = self._interrupt_current(reason)
+        if turn is None:
+            return
+        delivered = self._terminal_delivery[turn.turn_id]
+        try:
+            async with asyncio.timeout(
+                self._settings.backpressure_timeout_ms / 1_000
+            ):
+                await delivered.wait()
+        except TimeoutError:
+            pass
 
     async def _write_loop(self) -> None:
         while True:
@@ -326,10 +518,22 @@ class CallSession:
             await self._transport.send(event)
             self._session_metrics.record_turn(turn.metrics)
             turn.playback_open = False
+            delivered = self._terminal_delivery.get(turn.turn_id)
+            if delivered is not None:
+                delivered.set()
+            logger.info(
+                "turn_terminal session_id=%s turn_id=%s outcome=%s",
+                self.session_id,
+                turn.turn_id,
+                turn.outcome.value,
+            )
             await self._outbound.ack(action)
             return
 
         await self._transport.send(item)
+        waiter = self._delivery_waiters.get(item.event_id)
+        if waiter is not None:
+            waiter.set()
         if isinstance(item, LLMToken):
             self._turns[item.turn_id].metrics.record_token_sent(
                 self._clock.monotonic_ns()
@@ -357,6 +561,12 @@ class CallSession:
         )
         await self._transport.send(event)
         self._session_metrics.record_turn(turn.metrics)
+        logger.info(
+            "turn_terminal session_id=%s turn_id=%s outcome=%s",
+            self.session_id,
+            turn.turn_id,
+            turn.outcome.value,
+        )
         if self._current_turn_id == turn.turn_id:
             self._current_turn_id = None
         reservation = turn.lifecycle_reservation
@@ -396,10 +606,12 @@ class CallSession:
                     task.cancel()
                     await task
                 else:
-                    task.result()
+                    try:
+                        task.result()
+                    except BaseException:
+                        pass
             except asyncio.CancelledError:
-                if not task.done():
-                    raise
+                raise
             except BaseException:
                 pass
             finally:
