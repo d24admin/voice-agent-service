@@ -2,8 +2,8 @@ import asyncio
 
 import pytest
 
-from app.providers import ChatMessage, MockLLMProvider
-from app.tts import SentenceBuffer
+from app.providers.llm import ChatMessage, MockLLMProvider
+from app.providers.tts import SentenceBuffer
 
 
 MESSAGES = [ChatMessage(role="user", content="hello")]

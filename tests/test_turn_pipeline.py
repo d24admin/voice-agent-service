@@ -14,7 +14,7 @@ from app.outbound import (
     SendAction,
     TerminalCommand,
 )
-from app.providers import ChatMessage
+from app.providers.llm import ChatMessage
 from app.turn import ActiveTurnRunner, TurnState
 
 

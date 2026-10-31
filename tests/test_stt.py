@@ -1,4 +1,4 @@
-from app.stt import SimulatedSTT
+from app.providers.stt import SimulatedSTT
 
 
 def test_accept_frame_emits_cumulative_ordered_partials() -> None:

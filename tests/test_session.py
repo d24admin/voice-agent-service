@@ -18,7 +18,7 @@ from app.events import (
     TurnCompleted,
 )
 from app.metrics import MetricsRegistry
-from app.providers import MockLLMProvider
+from app.providers.llm import MockLLMProvider
 from app.session import CallSession
 from tests.conftest import FakeTransport, event_fields, live_session_tasks
 

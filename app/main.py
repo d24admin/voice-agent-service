@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from app.clock import Clock, SystemClock
 from app.config import Settings
 from app.metrics import MetricsRegistry
-from app.providers import LLMProvider, MockLLMProvider
+from app.providers.llm import LLMProvider, MockLLMProvider
 from app.session import CallSession
 from app.transport import TransportDisconnected, WebSocketEventTransport
 

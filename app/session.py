@@ -34,8 +34,8 @@ from app.outbound import (
     SendAction,
     TerminalCommand,
 )
-from app.providers import ChatMessage, LLMProvider
-from app.stt import FinalResult, SimulatedSTT
+from app.providers.llm import ChatMessage, LLMProvider
+from app.providers.stt import FinalResult, SimulatedSTT
 from app.transport import EventTransport, ProtocolError, TransportDisconnected
 from app.turn import ActiveTurnRunner, TurnState
 

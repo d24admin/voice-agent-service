@@ -11,8 +11,8 @@ from app.config import Settings
 from app.events import AudioChunk, LLMToken
 from app.metrics import TurnMetrics, TurnOutcome
 from app.outbound import LifecycleReservation, OutboundBuffer, TerminalCommand
-from app.providers import ChatMessage, LLMProvider
-from app.tts import SentenceBuffer
+from app.providers.llm import ChatMessage, LLMProvider
+from app.providers.tts import SentenceBuffer
 
 __all__ = ["ActiveTurnRunner", "TurnOutcome", "TurnState"]
 

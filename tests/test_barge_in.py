@@ -16,7 +16,7 @@ from app.events import (
     TurnInterrupted,
 )
 from app.metrics import TurnOutcome
-from app.providers import ChatMessage
+from app.providers.llm import ChatMessage
 from tests.conftest import FakeTransport, event_fields, live_session_tasks
 from tests.test_session import make_session, settings, start, stop
 
