@@ -74,6 +74,36 @@ silently ignored.
 
 ## Architecture
 
+The application package is grouped by the part of the call flow each module
+owns:
+
+```text
+app/
+├── api/
+│   ├── server.py                FastAPI factory and routes
+│   ├── events.py                WebSocket event schemas
+│   └── websocket_transport.py   JSON WebSocket adapter
+├── conversation/
+│   ├── session_manager.py       Active-session ownership
+│   ├── call_session.py          Call lifecycle and barge-in
+│   ├── turn_state.py            Terminal state transitions
+│   ├── turn_pipeline.py         Concurrent LLM-to-TTS flow
+│   └── outbound_buffer.py       Ordering and stale-output fencing
+├── providers/
+│   ├── stt.py                   Simulated streaming STT
+│   ├── llm.py                   Provider contract and mock LLM
+│   └── tts.py                   Sentence buffering and simulated TTS
+├── config.py
+├── clock.py
+└── metrics.py
+```
+
+The primary reading path is `api/server.py` →
+`conversation/call_session.py` → `conversation/turn_pipeline.py` →
+`providers/` → `conversation/outbound_buffer.py`. Cross-cutting settings,
+time, and metrics remain at the package root because each is small and shared
+by multiple areas.
+
 ```text
 JSON WebSocket
       |
