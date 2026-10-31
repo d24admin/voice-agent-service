@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import websockets
 
-from app.metrics import TurnMetrics
+from app.metrics import TurnMetrics, TurnOutcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +162,8 @@ async def run_call(
         TurnMetrics.model_validate({"baseline_ns": 0, **turn})
         for turn in summary.get("turns", [])
     )
+    if any(metrics.outcome is TurnOutcome.FAILED for metrics in turn_metrics):
+        terminal_outcome = "failed"
     if scenario == "barge_in":
         interrupted = int(summary.get("counts", {}).get("interrupted", interrupted))
     return CallResult(

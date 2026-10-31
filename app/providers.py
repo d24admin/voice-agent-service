@@ -17,7 +17,10 @@ class ChatMessage:
 
 class LLMProvider(Protocol):
     def stream(
-        self, messages: Sequence[ChatMessage], turn_id: int
+        self,
+        messages: Sequence[ChatMessage],
+        turn_id: int,
+        session_id: str | None = None,
     ) -> AsyncIterator[str]: ...
 
 
@@ -39,9 +42,12 @@ class MockLLMProvider:
         self._cursor = 0
 
     async def stream(
-        self, messages: Sequence[ChatMessage], turn_id: int
+        self,
+        messages: Sequence[ChatMessage],
+        turn_id: int,
+        session_id: str | None = None,
     ) -> AsyncIterator[str]:
-        del messages, turn_id
+        del messages, turn_id, session_id
         response_index = min(self._cursor, len(self._responses) - 1)
         self._cursor += 1
         for token in self._responses[response_index].split():

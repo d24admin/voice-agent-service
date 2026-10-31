@@ -28,6 +28,7 @@ class TurnMetrics(BaseModel):
     total_latency_ms: float | None = None
     token_count: int = 0
     audio_chunk_count: int = 0
+    terminal_delivered: bool = True
 
     def _elapsed_ms(self, now_ns: int) -> float:
         return max(0.0, (now_ns - self.baseline_ns) / 1_000_000)
@@ -85,6 +86,12 @@ class SessionMetrics:
         self.timeout_count = 0
         self.overload_count = 0
         self.stale_event_drop_count = 0
+        self.queue_high_water = {
+            "inbound": 0,
+            "token": 0,
+            "outbound_data": 0,
+            "outbound_lifecycle": 0,
+        }
 
     def mark_started(self, turn_id: int) -> None:
         if turn_id in self._started_ids:
@@ -102,9 +109,20 @@ class SessionMetrics:
         self._counts[metrics.outcome.value] += 1
         self._turns.append(metrics.model_copy(deep=True))
 
+    def observe_queue(self, name: str, size: int) -> None:
+        if name not in self.queue_high_water:
+            raise ValueError(f"unknown queue metric: {name}")
+        self.queue_high_water[name] = max(self.queue_high_water[name], size)
+
+    @property
+    def next_turn_id(self) -> int:
+        return max(self._started_ids | self._recorded_ids, default=0) + 1
+
     def summary(self, *, include_turns: bool = True) -> dict[str, Any]:
         completed = [
-            turn for turn in self._turns if turn.outcome is TurnOutcome.COMPLETED
+            turn
+            for turn in self._turns
+            if turn.outcome is TurnOutcome.COMPLETED and turn.terminal_delivered
         ]
         result: dict[str, Any] = {
             "session_id": self.session_id,
@@ -125,6 +143,7 @@ class SessionMetrics:
             "timeouts": self.timeout_count,
             "overloads": self.overload_count,
             "stale_event_drops": self.stale_event_drop_count,
+            "queue_high_water": dict(self.queue_high_water),
         }
         if include_turns:
             result["turns"] = [turn.model_dump(mode="json") for turn in self._turns]
@@ -169,7 +188,7 @@ class MetricsRegistry:
             turn
             for session in self._sessions.values()
             for turn in session.turns
-            if turn.outcome is TurnOutcome.COMPLETED
+            if turn.outcome is TurnOutcome.COMPLETED and turn.terminal_delivered
         ]
         counts = {
             key: sum(session.summary(include_turns=False)["counts"][key] for session in self._sessions.values())

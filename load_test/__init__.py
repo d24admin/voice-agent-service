@@ -54,7 +54,11 @@ async def run_load(
         if isinstance(result, BaseException):
             errors.append(_safe_error(result))
             continue
-        if result.errors or result.outcome == "failed":
+        has_failed_turn = any(
+            metrics.outcome is TurnOutcome.FAILED
+            for metrics in result.turn_metrics
+        )
+        if result.errors or result.outcome == "failed" or has_failed_turn:
             errors.extend(result.errors or ("call reported failed outcome",))
             continue
         successes.append(result)

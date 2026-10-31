@@ -65,7 +65,8 @@ curl -fsS 'http://127.0.0.1:8000/metrics?session_id=<session-id>'
 Runtime settings use explicit `VOICE_` variables. For example:
 
 ```bash
-VOICE_PORT=9000 VOICE_SILENCE_TIMEOUT_MS=250 python -m app
+VOICE_PORT=9000 VOICE_SILENCE_TIMEOUT_MS=250 \
+VOICE_SYSTEM_PROMPT="Be brief and helpful." python -m app
 ```
 
 Unknown `VOICE_` settings and invalid bounds fail at startup instead of being
@@ -91,7 +92,8 @@ JSON WebSocket
 |                        +-------------|-----------+            |
 |                                      v                       |
 | ordered data + reserved lifecycle -> single writer -> socket |
-| cancelled supervisors -------------> turn reaper             |
+| cancelled supervisors -------> concurrent retirement monitors|
+| queue/write overload --------> independent abort signal       |
 +--------------------------------------------------------------+
 ```
 
@@ -129,8 +131,9 @@ client                         server
 During barge-in, the orchestrator performs four non-awaiting operations in the
 same event-loop turn: claim `interrupted`, invalidate the old output fence,
 cancel and hand off the supervisor, and enqueue `turn.interrupted`. It then
-accepts the triggering caller frame. The reaper waits for provider cleanup so
-new STT work never blocks on a cancellation-resistant adapter.
+accepts the triggering caller frame. A per-supervisor retirement monitor waits
+for provider cleanup, so multiple slow cancellations cannot serialize or block
+new STT work. The session still owns and gathers every supervisor at shutdown.
 
 ## Task ownership and cancellation
 
@@ -142,10 +145,11 @@ Every `asyncio.create_task` has one owner and one terminal path.
 | Orchestrator | Serialize protocol, STT, endpointing, and barge-in transitions | Stop, fatal policy, or shutdown request | Session cleanup cancels it and the silence timer |
 | Writer | Be the only transport writer; apply sequence/fence policy; stamp observed metrics | Outbound closes | Session cleanup cancels and awaits it |
 | Silence timer | Endpoint one versioned utterance after inactivity | Enqueues one `SilenceExpired` | Replaced by a frame, explicit end, or shutdown |
-| Active-turn supervisor | Own one LLM/TTS `TaskGroup` | Both pipeline children finish | Invalidated and cancelled on barge-in/session end, then transferred to reaper |
+| Active-turn supervisor | Own one LLM/TTS `TaskGroup` | Both pipeline children finish | Invalidated and cancelled on barge-in/session end; retained by the session until gathered |
 | LLM producer | Stream provider tokens while TTS handles earlier text | Marks generation closed and queues internal end-of-stream | Supervisor/`TaskGroup` cancellation; provider iterator is closed in `finally` |
 | TTS consumer | Segment live tokens and emit sentence chunks | Flushes trailing text and queues output-complete | Same `TaskGroup` cancellation; buffered obsolete text is discarded |
-| Turn reaper | Await fenced cancelled supervisors outside caller-input path | Retired task releases resources | Session shutdown cancels it after all owned tasks are cancelled |
+| Retirement monitor | Await one fenced cancelled supervisor outside caller-input path | Retired task releases resources | Session cleanup cancels every monitor after all supervisors are cancelled |
+| Abort waiter | End the session without entering a full inbound/outbound queue | Independent abort signal is set | Session cleanup gathers it |
 | Load-call coroutine | Keep each simulated call isolated | One `CallResult` | `gather(return_exceptions=True)` retrieves every result independently |
 
 Cancellation is cooperative, but correctness does not depend on prompt provider
@@ -172,12 +176,17 @@ Per-turn metrics use a monotonic clock and include:
 - TTFT: endpoint to the first successfully written `llm.token`.
 - TTFA: endpoint to the first successfully written `audio.chunk`.
 - Total latency: endpoint to terminal-event dispatch.
-- Actual successfully written token/audio counts and terminal outcome.
+- Actual successfully written token/audio counts, terminal outcome, and whether
+  the terminal event reached the peer.
 
 The writer stamps TTFT/TTFA only after transport send succeeds. Missing values
 on interrupted or failed turns serialize as `null`, never zero. `/metrics`
-uses nearest-rank p50/p95 over completed-turn samples. Session records remain
-available in a bounded in-memory LRU after disconnect.
+uses nearest-rank p50/p95 over completed turns whose terminal event was
+delivered; undelivered terminal records are retained for accounting but cannot
+skew latency percentiles. It also exposes inbound, token, outbound-data, and
+outbound-lifecycle queue high-water marks. Session records remain available in
+a bounded in-memory LRU after disconnect, and reconnecting with the same
+session ID continues turn numbering.
 
 ## Failure behavior
 
@@ -187,7 +196,7 @@ available in a bounded in-memory LRU after disconnect.
 | Malformed/unsupported event | Typed recoverable `error`; connection remains usable |
 | Fatal protocol violation | Best-effort fatal `error`, terminalize open turn, close `1008` |
 | Oversized input | Close `1009` without retaining the payload |
-| Inbound/lifecycle backpressure | Bounded queues remain bounded; typed overload and close `1013` |
+| Inbound/lifecycle backpressure | Bounded queues remain bounded; an independent abort path closes `1013` even when the writer is stalled |
 | First-token/generation timeout | Invalidate unsent stream output and emit one `turn.failed` |
 | Provider error after visible output | Preserve written events, fence queued output, no replay, emit `turn.failed` |
 | Caller barge-in | Atomically interrupt/fence old turn, accept the same caller frame, reap cleanup separately |
@@ -218,6 +227,9 @@ Deepgram interim and endpointed transcripts map to the existing partial/final
 events. A local Whisper deployment adds VAD, rolling audio windows, and
 transcript-stability handling. A real TTS adapter consumes the same sentence
 stream and forwards audio bytes as soon as the provider returns them.
+Each provider request receives the configured system prompt, completed
+user/assistant history, turn ID, and session ID. Interrupted or failed partial
+answers are deliberately excluded from later context.
 
 For browser calls, WebRTC carries inbound/outbound media. For telephone calls,
 SIP or Twilio Media Streams connects to the same orchestrator. Production

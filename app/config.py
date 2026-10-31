@@ -12,6 +12,7 @@ class Settings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    system_prompt: str = "You are a concise, helpful voice assistant."
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65_535)
     stt_partial_delay_ms: PositiveInt = 20

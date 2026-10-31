@@ -18,6 +18,12 @@ def completed_metrics(turn_id: int, value: float) -> TurnMetrics:
     return metrics
 
 
+def failed_metrics(turn_id: int) -> TurnMetrics:
+    metrics = TurnMetrics(turn_id=turn_id, baseline_ns=0)
+    metrics.finalize(TurnOutcome.FAILED, "provider_error", 1_000_000)
+    return metrics
+
+
 @pytest.mark.asyncio
 async def test_default_twenty_calls_are_concurrent_unique_and_failure_isolated() -> None:
     active = 0
@@ -93,6 +99,29 @@ async def test_result_errors_count_as_failure_without_cancelling_siblings() -> N
     assert report.succeeded == 2
     assert report.failed == 1
     assert report.errors == ("server rejected call",)
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_metrics_cannot_be_hidden_by_completed_call_outcome() -> None:
+    async def fake_run_call(
+        server_url: str,
+        scenario: str,
+        session_id: str,
+    ) -> CallResult:
+        del server_url, scenario
+        return CallResult(
+            session_id=session_id,
+            outcome="completed",
+            turn_metrics=(failed_metrics(1), completed_metrics(2, 5)),
+            interrupted_turns=0,
+            errors=(),
+        )
+
+    report = await run_load(concurrency=1, call_runner=fake_run_call)
+
+    assert report.succeeded == 0
+    assert report.failed == 1
+    assert report.errors == ("call reported failed outcome",)
 
 
 @pytest.mark.asyncio

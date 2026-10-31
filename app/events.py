@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import (
@@ -26,7 +26,7 @@ class Event(BaseModel):
     def require_timezone(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("timestamp must include a timezone")
-        return value
+        return value.astimezone(UTC)
 
 
 class SessionStart(Event):

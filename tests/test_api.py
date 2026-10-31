@@ -181,11 +181,19 @@ def test_inbound_overload_closes_1013() -> None:
             receive_until(ws, "session.ready")
             for index in range(8):
                 ws.send_json(payload("audio.frame", event_id=f"f-{index}", text="word"))
-            error = receive_until(ws, "error")
-            assert error["code"] == "overloaded"
             with pytest.raises(WebSocketDisconnect) as closed:
-                ws.receive_json()
+                while True:
+                    ws.receive_json()
             assert closed.value.code == 1013
+
+
+def test_oversized_session_id_closes_1008() -> None:
+    app = create_app(api_settings())
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as closed:
+            with client.websocket_connect(f"/ws/{'x' * 129}") as ws:
+                ws.receive_json()
+        assert closed.value.code == 1008
 
 
 @pytest.mark.asyncio

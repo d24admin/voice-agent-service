@@ -109,6 +109,9 @@ def create_app(
     @app.websocket("/ws/{session_id}")
     async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         await websocket.accept()
+        if not 1 <= len(session_id) <= 128:
+            await websocket.close(code=1008)
+            return
         transport = WebSocketEventTransport(
             websocket,
             max_message_bytes=selected_settings.max_message_bytes,

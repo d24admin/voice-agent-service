@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.clock import Clock, SystemClock
 from app.config import Settings
@@ -18,6 +18,7 @@ __all__ = ["ActiveTurnRunner", "TurnOutcome", "TurnState"]
 
 
 Sleep = Callable[[float], Awaitable[None]]
+QueueObserver = Callable[[str, int], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,9 @@ class TurnState:
     playback_open: bool = True
     output_valid: bool = True
     lifecycle_reservation: LifecycleReservation | None = None
+    user_text: str = ""
+    response_tokens: list[str] = field(default_factory=list)
+    history_committed: bool = False
 
     def interrupt(self, reason: str) -> bool:
         return self._claim_terminal(TurnOutcome.INTERRUPTED, reason, invalidate=True)
@@ -94,6 +98,7 @@ class ActiveTurnRunner:
         session_id: str,
         clock: Clock | None = None,
         sleep: Sleep = asyncio.sleep,
+        observe_queue: QueueObserver | None = None,
     ) -> None:
         self._provider = provider
         self._outbound = outbound
@@ -101,6 +106,7 @@ class ActiveTurnRunner:
         self._session_id = session_id
         self._clock = SystemClock() if clock is None else clock
         self._sleep = sleep
+        self._observe_queue = observe_queue
 
     async def run(
         self, turn: TurnState, messages: Sequence[ChatMessage]
@@ -143,7 +149,11 @@ class ActiveTurnRunner:
         messages: Sequence[ChatMessage],
         token_queue: asyncio.Queue[str | _EndOfStream],
     ) -> None:
-        stream = self._provider.stream(messages, turn.turn_id)
+        try:
+            stream = self._provider.stream(messages, turn.turn_id, self._session_id)
+        except TypeError:
+            # Backward-compatible adapter for simple two-argument assessment fakes.
+            stream = self._provider.stream(messages, turn.turn_id)
         iterator = aiter(stream)
         try:
             try:
@@ -202,6 +212,7 @@ class ActiveTurnRunner:
             ),
             turn.turn_id,
         )
+        turn.response_tokens.append(token)
         if not turn.output_valid:
             raise _TurnInvalidated
         await self._put_token_queue(token_queue, token)
@@ -258,6 +269,8 @@ class ActiveTurnRunner:
                 self._settings.backpressure_timeout_ms / 1_000
             ):
                 await queue.put(item)
+                if self._observe_queue is not None:
+                    self._observe_queue("token", queue.qsize())
         except TimeoutError as exc:
             raise _BackpressureTimeout from exc
 
@@ -271,6 +284,8 @@ class ActiveTurnRunner:
                     turn_id=turn_id,
                     fenced=True,
                 )
+                if self._observe_queue is not None:
+                    self._observe_queue("outbound_data", self._outbound.data_size)
         except TimeoutError as exc:
             raise _BackpressureTimeout from exc
 

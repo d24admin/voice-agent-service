@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -122,6 +122,18 @@ def test_event_rejects_naive_timestamp() -> None:
 
     with pytest.raises(ValidationError):
         parse_client_event(payload)
+
+
+def test_event_normalizes_aware_timestamp_to_utc() -> None:
+    payload = event_payload("ping")
+    payload["timestamp"] = datetime(
+        2026, 10, 31, 15, 30, tzinfo=timezone(timedelta(hours=5, minutes=30))
+    )
+
+    event = parse_client_event(payload)
+
+    assert event.timestamp == datetime(2026, 10, 31, 10, 0, tzinfo=UTC)
+    assert event.timestamp.tzinfo is UTC
 
 
 def test_turn_scoped_server_event_requires_integer_turn_id() -> None:

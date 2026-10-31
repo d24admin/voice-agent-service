@@ -264,8 +264,10 @@ async def test_disconnect_during_terminal_send_retains_internal_not_delivered_st
     assert summary is not None
     assert summary["counts"] == {
         "started": 1,
-        "completed": 0,
+        "completed": 1,
         "interrupted": 0,
         "failed": 0,
     }
+    assert summary["turns"][0]["terminal_delivered"] is False
+    assert summary["ttft"]["sample_count"] == 0
     assert live_session_tasks("session-1") == []
