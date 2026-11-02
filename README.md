@@ -1,13 +1,15 @@
 # Voice Agent Service
 
-A locally runnable real-time voice orchestration assessment: simulated streaming
-STT feeds a streaming mock LLM, tokens feed sentence-level simulated TTS before
-generation finishes, and barge-in cancels obsolete work without leaking stale
-audio. Audio is represented by text so the concurrency, latency, endpointing,
-backpressure, and interruption behavior can run without credentials or media
-hardware.
+A locally runnable orchestration layer for a streaming voice bot. Text chunks
+stand in for audio, but the difficult parts are real: partial and final STT,
+streaming LLM tokens, sentence-level TTS pipelining, caller interruption,
+bounded queues, task cancellation, event ordering, and latency measurement.
 
-## Quick start
+No credentials, microphone, audio device, or external provider is required.
+The scenario catalog contains four deterministic agents; ecommerce remains the
+primary barge-in demonstration and default agent.
+
+## Review this project in five minutes
 
 Python 3.11 or newer is required.
 
@@ -20,41 +22,303 @@ python -m pip install -r requirements.txt
 Start the service:
 
 ```bash
-python -m app
+python -m app --scenario-dir scenarios
 ```
 
-In another terminal, run either deterministic call:
+In another terminal, run the scripted caller:
 
 ```bash
 source .venv/bin/activate
-python -m client --scenario default
-python -m client --scenario barge_in
+python -m client --scenario-file scenarios/ecommerce.json
 ```
 
-The default scenario uses both explicit `audio.end` and silence endpointing.
-The barge-in scenario waits for the first bot `audio.chunk`, interrupts it, and
-fails if any old-turn audio appears after `turn.interrupted`. Add `--verbose`
-for machine-readable JSON Lines.
+The trace demonstrates partial/final transcripts, word-by-word LLM output,
+TTS starting before generation finishes, and a guaranteed barge-in. The first
+bot answer is interrupted 250 ms after its first audio chunk; the second caller
+turn changes the request from replacement to refund.
 
-Run 20 isolated calls concurrently:
+Then run the required 20-call load check and the test suite:
 
 ```bash
-python -m load_test
+python -m load_test --scenario-dir scenarios --concurrency 20 --seed 42
+pytest -q
 ```
 
-Override load options when needed:
+The load command distributes calls reproducibly across the four agents. It
+reports requested/successful calls, unique sessions, actual peak concurrency,
+turn outcomes, and completed-turn p50/p95 latency overall and per agent.
 
-```bash
-python -m load_test --concurrency 20 --scenario barge_in --server-url ws://127.0.0.1:8000
+The shortest useful code-reading path is:
+
+1. [app/api/server.py](app/api/server.py) — HTTP/WebSocket entry points and
+   per-session dependency construction.
+2. [app/conversation/call_session.py](app/conversation/call_session.py) — the
+   session controller, endpointing, barge-in, output queue, and writer.
+3. [app/conversation/turn_pipeline.py](app/conversation/turn_pipeline.py) — the
+   concurrent LLM producer and sentence-TTS consumer.
+4. [app/conversation/turn_state.py](app/conversation/turn_state.py) — minimal,
+   single-assignment turn state.
+5. [tests/test_barge_in.py](tests/test_barge_in.py) — the concurrency invariants
+   expressed as executable tests.
+
+## What successful output looks like
+
+The normal CLI is intentionally readable rather than raw JSON:
+
+```text
+SHOPHELP · ecommerce · session call-...
+────────────────────────────────────────────────
+
+TURN 1
+STT …   Hi, my order arrived damaged.
+STT ✓   Hi, my order arrived damaged. I would like replacement options.
+LLM     I am sorry your order arrived damaged.
+TTS ▶   “I am sorry your order arrived damaged.”
+LLM     I can help you review…
+
+⚡ BARGE-IN · turn 2 started 250 ms after first audio
+RESULT  INTERRUPTED · barge_in
+LATENCY TTFT ... · TTFA ... · total ...
 ```
 
-Run the complete test suite:
+Consecutive LLM tokens stay on a flowing line; TTS and terminal events break
+the line at their true arrival position. The final report shows caller text,
+generated text, numbered spoken chunks, outcome, reason, and latency per turn.
+Interrupted output is labelled partial. Interactive terminals use restrained
+color; redirected output and `NO_COLOR=1` stay plain. `--verbose` switches to
+machine-readable JSON Lines.
 
-```bash
-pytest -v
+The load report explicitly separates call health from turn behavior and uses
+only completed turns from successful calls for latency percentiles:
+
+```text
+LOAD TEST · seed 42
+CALLS     requested 20 · succeeded 20 · failed 0
+SESSIONS  unique 20 · peak concurrency 20
+TURNS     completed ... · interrupted ... · failed ...
+
+COMPLETED-TURN LATENCY · OVERALL
+Metric  Samples  p50       p95
+...
+
+AGENTS
+appointments
+  Calls  requested ... · succeeded ... · failed ...
+  Turns  completed ... · interrupted ... · failed ...
+  ...
 ```
 
-Inspect the service after a demo:
+The important correctness assertion is stronger than the display: after
+`turn.interrupted`, any old-turn `llm.token` or `audio.chunk` fails the client
+run.
+
+## Runtime architecture
+
+```text
+Scenario catalog
+  ├── server selects one agent with ?scenario_id=...
+  ├── scenario configures prompt, responses, and timings
+  └── client runs that scenario's caller turns and barge-in timing
+
+JSON WebSocket
+      │
+      ▼
+CallSession controller ──► simulated STT ──► final transcript
+      │                                           │
+      │                                           ▼
+      │                              per-turn asyncio.TaskGroup
+      │                              ┌─────────────────────────┐
+      │                              │ LLM producer            │
+      │                              │       │ bounded tokens   │
+      │                              │       ▼                  │
+      │                              │ sentence TTS consumer   │
+      │                              └────────────┬────────────┘
+      │                                           │
+      └────────────► bounded FIFO output queue ◄──┘
+                                │
+                                ▼
+                         one socket writer
+```
+
+One `CallSession` owns one connection and all tasks created for it. The
+controller waits for the next WebSocket event, application shutdown, writer
+failure, or the current silence deadline. There is no receiver-loop /
+orchestrator split and no separate silence-timer task.
+
+When STT produces a final transcript, the session starts an
+`ActiveTurnRunner`. Its `TaskGroup` contains two children connected by a
+bounded token queue:
+
+- the LLM producer emits each token immediately and continues generating;
+- the TTS consumer builds complete sentences and speaks each sentence after
+  its simulated synthesis delay.
+
+This is genuine overlap: while TTS waits on an earlier sentence, the LLM can
+continue producing later tokens.
+
+All server events use one bounded FIFO queue and one writer. The writer is the
+only task that sends on the WebSocket, which makes event ordering and latency
+measurement easy to reason about.
+
+## Turn flow and barge-in
+
+A normal explicit-endpointed turn looks like this:
+
+```text
+session.start
+  → session.ready
+audio.frame(s)
+  → transcript.partial(s)
+audio.end
+  → transcript.final
+  → llm.token(s)
+  → audio.chunk(s) as sentences become ready
+  → turn.completed
+session.stop
+```
+
+Silence endpointing follows the same path, except the controller finalizes STT
+when its current silence deadline expires.
+
+An incoming caller frame interrupts an active bot turn before that frame is
+added to STT:
+
+```text
+new audio.frame
+  → claim the old turn as interrupted
+  → invalidate old-turn output
+  → cancel the old turn task
+  → enqueue turn.interrupted
+  → process the new caller frame
+```
+
+The input path never waits for provider cleanup. Cancellation is cooperative,
+so correctness does not rely on it happening immediately. The implementation
+uses two output fences:
+
+1. the turn pipeline stops enqueueing after the turn becomes invalid;
+2. the writer drops already queued tokens/audio whose turn is invalid.
+
+Terminal state is single-assignment, so a completion racing with an interrupt
+cannot produce two terminal events. The session still owns cancelled turn tasks
+and gathers remaining work during shutdown.
+
+## Design choices and tradeoffs
+
+| Choice | Why | Tradeoff |
+|---|---|---|
+| One `CallSession` per WebSocket | Keeps protocol state, STT, turn state, history, and task ownership together | Session state is in-memory and connection-scoped |
+| One controller | Serializes caller input and turn transitions without locks | Slow work must be moved into owned tasks |
+| `TaskGroup` per turn | Gives the LLM/TTS pair structured cancellation and cleanup | A turn is the smallest independent pipeline unit |
+| Bounded token and output queues | Prevents unbounded memory growth and provides natural backpressure | A slow consumer can delay producers |
+| One writer | Prevents concurrent socket writes and provides one ordering/metrics boundary | All outbound events share the same FIFO |
+| Cancellation plus turn-ID fencing | Prevents stale output even when a provider cleans up slowly | In-flight bytes already being sent cannot be recalled |
+| Fresh mock provider per session | Gives concurrent calls independent response cursors | Mock conversation state is not shared across reconnects |
+| Strict shared scenario catalog | Server, client, and load runner share validated agent IDs | Server and runner must load matching catalogs |
+| Seeded random load assignment | Repeated runs exercise the same agent distribution | It is deterministic test randomness, not production routing |
+| Monotonic in-memory metrics | Produces reliable durations without infrastructure | Metrics reset when the process restarts |
+
+The assessment intentionally does not implement reconnect continuity,
+persistent metrics, real media, or external providers. Those are adapter and
+deployment concerns rather than prerequisites for demonstrating the core
+streaming and interruption behavior.
+
+## Async task ownership
+
+Every spawned task has an owner and an explicit cleanup path.
+
+| Task | Reason it exists | Cancellation and cleanup |
+|---|---|---|
+| Pending WebSocket receive | Lets the controller race input against silence and shutdown | Replaced after each event; cancelled and gathered during cleanup |
+| Session shutdown waiter | Wakes the controller when the application is stopping | Cancelled and gathered with the receive task |
+| Socket writer | Serializes every transport send | Queue drains normally; a stalled writer is cancelled after shutdown grace |
+| Turn task | Owns one bot response independently of caller input | Cancelled on barge-in/session end and tracked until done |
+| LLM producer | Streams provider tokens while TTS handles earlier text | Owned by the per-turn `TaskGroup` |
+| TTS consumer | Segments tokens and emits sentence audio | Owned by the same `TaskGroup`; sibling failure cancels it |
+| Client barge timer and receive | Keeps consuming server events during the configured delay | Losing task is cancelled; both are gathered in `finally` |
+| Load-call coroutines | Run isolated sessions concurrently | `gather(return_exceptions=True)` retrieves every result so one failure does not cancel siblings |
+
+Application shutdown requests every live session to stop, waits up to the
+configured grace period, then force-cancels remaining session work. The session
+records its final internal metrics and closes the transport even when the
+writer was stalled.
+
+## Assessment requirements and evidence
+
+| Requirement | Implementation | Primary evidence |
+|---|---|---|
+| FastAPI WebSocket and scripted CLI | [app/api/server.py](app/api/server.py), [app/api/events.py](app/api/events.py), [client](client) | [tests/test_api.py](tests/test_api.py), [tests/test_client.py](tests/test_client.py) |
+| Partial/final STT and silence endpointing | [app/providers/stt.py](app/providers/stt.py), `CallSession` | [tests/test_stt.py](tests/test_stt.py), [tests/test_session.py](tests/test_session.py) |
+| Streaming provider interface and mock LLM | [app/providers/llm.py](app/providers/llm.py), `ActiveTurnRunner` | [tests/test_turn_pipeline.py](tests/test_turn_pipeline.py) |
+| Sentence TTS before generation finishes | [app/providers/tts.py](app/providers/tts.py), `ActiveTurnRunner` | overlap test in [tests/test_turn_pipeline.py](tests/test_turn_pipeline.py) |
+| Correct barge-in and no stale output | `CallSession`, `TurnState`, writer fence | [tests/test_barge_in.py](tests/test_barge_in.py) |
+| TTFT, TTFA, total latency, p50/p95 | [app/metrics.py](app/metrics.py), `GET /metrics` | [tests/test_metrics_state.py](tests/test_metrics_state.py) |
+| 20 concurrent simulated calls | [load_test](load_test) | [tests/test_load_test.py](tests/test_load_test.py) |
+| Event ordering and final-transcript retention | Session and client tests | [tests/test_session.py](tests/test_session.py), [tests/test_client.py](tests/test_client.py) |
+
+## Metrics and latency budget
+
+Per-turn metrics use a monotonic clock:
+
+- **TTFT** — endpoint to the first successfully written `llm.token`;
+- **TTFA** — endpoint to the first successfully written `audio.chunk`;
+- **total turn latency** — endpoint to the terminal outcome;
+- successfully written token/audio counts and the terminal outcome.
+
+`GET /metrics?session_id=...` returns one session, while `GET /metrics` combines
+the sessions currently retained by the process. Percentiles use nearest-rank
+p50/p95 over completed turns. The load runner independently aggregates the
+completed turns from successful calls.
+
+For conversational responsiveness, the meaningful ~800 ms target is speech-end
+to first audible response (TTFA), not completion of an arbitrarily long bot
+answer. A production budget could be allocated as follows:
+
+| Stage | Target |
+|---|---:|
+| Endpoint detection / VAD | 150 ms |
+| Network and orchestration | 50 ms |
+| LLM first token | 200 ms |
+| Tokens needed for the first speakable sentence | 150 ms |
+| TTS first chunk | 150 ms |
+| Output transport and playout | 50 ms |
+| Contingency | 50 ms |
+| **TTFA target** | **≤800 ms** |
+
+The deterministic fixture uses explicit endpointing for its barge-in demo. Its
+350 ms silence timeout favors predictable local behavior, not a production VAD
+target. Optimization effort should go first to endpoint detection, then LLM
+first-token latency, earlier clause/sentence segmentation, and TTS startup.
+Serialization and queue overhead should be optimized only after measuring them.
+
+## Interfaces, state, and failure behavior
+
+HTTP endpoints:
+
+- `GET /health` — process health;
+- `GET /metrics` — aggregate in-memory metrics;
+- `GET /metrics?session_id=...` — one session's metrics.
+
+The WebSocket endpoint is `WS /ws/{session_id}`. Catalog clients select an
+agent with the optional `?scenario_id=travel` query; omission uses ecommerce.
+An unknown ID closes with `1008` before provider or metric state is created.
+Every event contains a type, event ID, session ID, and timezone-aware timestamp.
+
+| Direction | Event types |
+|---|---|
+| Client → server | `session.start`, `audio.frame`, `audio.end`, `session.stop`, `ping` |
+| Server → client | `session.ready`, transcript partial/final, `llm.token`, `audio.chunk`, terminal turn events, `error`, `pong` |
+
+Malformed JSON and schema errors produce recoverable `error` events. Fatal
+protocol violations close with `1008`; oversized input uses `1009`; unexpected
+internal failure uses `1011`; normal stop uses `1000`. First-token and total
+generation safety timeouts produce one `turn.failed` outcome.
+
+Conversation history, STT state, active turns, and queues belong to one
+`CallSession`. Metrics live in the process-level registry. There is no database,
+cache, broker, scheduled job, or persistent state.
+
+Inspect a running service with:
 
 ```bash
 curl -fsS http://127.0.0.1:8000/health
@@ -62,287 +326,111 @@ curl -fsS http://127.0.0.1:8000/metrics
 curl -fsS 'http://127.0.0.1:8000/metrics?session_id=<session-id>'
 ```
 
-Runtime settings use explicit `VOICE_` variables. For example:
+## Configurable interview scenarios
+
+The default `scenarios/` catalog contains:
+
+| ID | Agent | Demonstrates |
+|---|---|---|
+| `ecommerce` | ShopHelp | Explicit endpointing and a guaranteed refund barge-in |
+| `travel` | TripAssist | Explicit then silence endpointing for a flight-change request |
+| `appointments` | ScheduleDesk | A guaranteed morning-to-afternoon barge-in |
+| `telecom` | NetHelp | Silence endpointing followed by normal troubleshooting |
+
+Each JSON scenario configures:
+
+- bot name and system prompt;
+- ordered mock responses and token delay;
+- caller frames, explicit/silence endpointing, and optional barge-in delay;
+- simulated STT, silence, and TTS timings.
+
+The Pydantic model in [app/scenario.py](app/scenario.py) forbids unknown fields
+and coercion, rejects empty frames/responses, validates delays, and rejects a
+barge-in delay on the first turn.
+
+For caller turn N, `barge_in_after_ms` means: wait for the first `audio.chunk`
+from turn N-1, keep receiving events for the configured delay, then send turn N.
+If the previous turn terminates before the timer fires, the run fails rather
+than silently turning into a normal follow-up.
+
+The scenario owns the prompt, mock responses, token delay, STT delay, silence
+timeout, and TTS delay. `tts_chunk_delay_ms` maps to the runtime setting
+`tts_sentence_delay_ms`. A fresh `MockLLMProvider` is built for every session,
+so concurrent calls never share response cursors.
+
+Catalog mode is the server default. Single-agent mode remains available and
+accepts only an omitted or matching `scenario_id`:
 
 ```bash
-VOICE_PORT=9000 VOICE_SILENCE_TIMEOUT_MS=250 \
-VOICE_SYSTEM_PROMPT="Be brief and helpful." python -m app
+python -m app --scenario-dir scenarios
+python -m app --scenario-dir scenarios --default-scenario-id travel
+python -m app --scenario-file scenarios/ecommerce.json
 ```
 
-Unknown `VOICE_` settings and invalid bounds fail at startup instead of being
-silently ignored.
+The load runner accepts the same `--default-scenario-id` when exercising a
+custom catalog that does not contain ecommerce.
 
-## Architecture
+Host, port, queue sizes, message limits, shutdown grace, and safety timeouts
+remain environment-owned:
 
-The application package is grouped by the part of the call flow each module
-owns:
-
-```text
-app/
-├── api/
-│   ├── server.py                FastAPI factory and routes
-│   ├── events.py                WebSocket event schemas
-│   └── websocket_transport.py   JSON WebSocket adapter
-├── conversation/
-│   ├── session_manager.py       Active-session ownership
-│   ├── call_session.py          Call lifecycle and barge-in
-│   ├── turn_state.py            Terminal state transitions
-│   ├── turn_pipeline.py         Concurrent LLM-to-TTS flow
-│   └── outbound_buffer.py       Ordering and stale-output fencing
-├── providers/
-│   ├── stt.py                   Simulated streaming STT
-│   ├── llm.py                   Provider contract and mock LLM
-│   └── tts.py                   Sentence buffering and simulated TTS
-├── config.py
-├── clock.py
-└── metrics.py
+```bash
+VOICE_PORT=9000 VOICE_OUTPUT_QUEUE_SIZE=256 \
+python -m app --scenario-dir scenarios
 ```
 
-The primary reading path is `api/server.py` →
-`conversation/call_session.py` → `conversation/turn_pipeline.py` →
-`providers/` → `conversation/outbound_buffer.py`. Cross-cutting settings,
-time, and metrics remain at the package root because each is small and shared
-by multiple areas.
+`Settings.from_environment()` accepts only known `VOICE_*` names. Scenario
+values overlay the prompt and simulation timing fields when the CLI starts the
+server; infrastructure limits cannot be overridden by JSON. Programmatic
+`create_app()` remains available for focused tests or alternate provider
+factories without loading a scenario file.
 
-```text
-JSON WebSocket
-      |
-      v
-+------------------------ CallSession -------------------------+
-| receiver -> bounded inbound queue -> orchestrator            |
-|                                      |                       |
-|                              simulated STT + silence timer    |
-|                                      | final transcript       |
-|                                      v                       |
-|                        +------ active turn ------+            |
-|                        | LLM producer            |            |
-|                        |       | bounded tokens  |            |
-|                        |       v                 |            |
-|                        | sentence TTS consumer   |            |
-|                        +-------------|-----------+            |
-|                                      v                       |
-| ordered data + reserved lifecycle -> single writer -> socket |
-| cancelled supervisors -------> concurrent retirement monitors|
-| queue/write overload --------> independent abort signal       |
-+--------------------------------------------------------------+
-```
+## Repository tour
 
-One `CallSession` owns every task and queue for a connection. STT state changes
-are serialized by the orchestrator. Each turn has one supervisor with exactly
-two `TaskGroup` children: the LLM producer and TTS consumer. Their bounded token
-queue permits the producer to continue while TTS sleeps on an earlier sentence,
-which is actual LLM/TTS overlap rather than merely reordered output.
-
-The outbound buffer has a bounded ordered-data lane and a reserved lifecycle
-lane. Every turn reserves terminal capacity before generation starts. All
-outbound items receive one enqueue sequence, so a lifecycle event acts as an
-ordering barrier: earlier non-stream events remain ordered, invalid old-turn
-tokens/audio are dropped, and higher-sequence data cannot jump ahead.
-
-### Example event flow
-
-```text
-client                         server
-  |-- session.start ----------->|
-  |<------------- session.ready |
-  |-- audio.frame "hello" ---->|
-  |<-------- transcript.partial |
-  |-- audio.frame "there" ---->|
-  |-- audio.end --------------->|
-  |<---------- transcript.final |
-  |<----------------- llm.token |  generation continues
-  |<--------------- audio.chunk |  first sentence already speaks
-  |<----------------- llm.token |
-  |<--------------- audio.chunk |
-  |<------------- turn.completed|
-  |-- session.stop ------------>|
-```
-
-During barge-in, the orchestrator performs four non-awaiting operations in the
-same event-loop turn: claim `interrupted`, invalidate the old output fence,
-cancel and hand off the supervisor, and enqueue `turn.interrupted`. It then
-accepts the triggering caller frame. A per-supervisor retirement monitor waits
-for provider cleanup, so multiple slow cancellations cannot serialize or block
-new STT work. The session still owns and gathers every supervisor at shutdown.
-
-## Task ownership and cancellation
-
-Every `asyncio.create_task` has one owner and one terminal path.
-
-| Task | Why it exists | Normal completion | Cancellation/cleanup |
-|---|---|---|---|
-| Receiver | Keep reading while orchestration and cleanup proceed | `session.stop` or peer disconnect | `CallSession.run()` cancels and awaits it |
-| Orchestrator | Serialize protocol, STT, endpointing, and barge-in transitions | Stop, fatal policy, or shutdown request | Session cleanup cancels it and the silence timer |
-| Writer | Be the only transport writer; apply sequence/fence policy; stamp observed metrics | Outbound closes | Session cleanup cancels and awaits it |
-| Silence timer | Endpoint one versioned utterance after inactivity | Enqueues one `SilenceExpired` | Replaced by a frame, explicit end, or shutdown |
-| Active-turn supervisor | Own one LLM/TTS `TaskGroup` | Both pipeline children finish | Invalidated and cancelled on barge-in/session end; retained by the session until gathered |
-| LLM producer | Stream provider tokens while TTS handles earlier text | Marks generation closed and queues internal end-of-stream | Supervisor/`TaskGroup` cancellation; provider iterator is closed in `finally` |
-| TTS consumer | Segment live tokens and emit sentence chunks | Flushes trailing text and queues output-complete | Same `TaskGroup` cancellation; buffered obsolete text is discarded |
-| Retirement monitor | Await one fenced cancelled supervisor outside caller-input path | Retired task releases resources | Session cleanup cancels every monitor after all supervisors are cancelled |
-| Abort waiter | End the session without entering a full inbound/outbound queue | Independent abort signal is set | Session cleanup gathers it |
-| Load-call coroutine | Keep each simulated call isolated | One `CallResult` | `gather(return_exceptions=True)` retrieves every result independently |
-
-Cancellation is cooperative, but correctness does not depend on prompt provider
-cancellation. A monotonically increasing turn ID and `output_valid` fence stop
-late tokens from entering TTS; the writer independently drops already queued
-old-turn tokens and audio. Terminal events are unfenced and emitted at most
-once through the turn's reserved lifecycle slot.
-
-## Protocol and metrics
-
-The WebSocket endpoint is `WS /ws/{session_id}`. Every event contains `type`,
-`event_id`, `session_id`, and a timezone-aware timestamp. Supported client
-events are `session.start`, `audio.frame`, `audio.end`, `session.stop`, and
-`ping`. Server events are `session.ready`, transcript partial/final, `llm.token`,
-`audio.chunk`, terminal turn events, `error`, and `pong`.
-
-Malformed JSON/schema errors are recoverable. Session-ID mismatches, audio
-before start, and duplicate start are fatal policy violations. Normal stop uses
-close code `1000`, fatal policy uses `1008`, oversized input uses `1009`, and
-overload uses `1013`.
-
-Per-turn metrics use a monotonic clock and include:
-
-- TTFT: endpoint to the first successfully written `llm.token`.
-- TTFA: endpoint to the first successfully written `audio.chunk`.
-- Total latency: endpoint to terminal-event dispatch.
-- Actual successfully written token/audio counts, terminal outcome, and whether
-  the terminal event reached the peer.
-
-The writer stamps TTFT/TTFA only after transport send succeeds. Missing values
-on interrupted or failed turns serialize as `null`, never zero. `/metrics`
-uses nearest-rank p50/p95 over completed turns whose terminal event was
-delivered; undelivered terminal records are retained for accounting but cannot
-skew latency percentiles. It also exposes inbound, token, outbound-data, and
-outbound-lifecycle queue high-water marks. Session records remain available in
-a bounded in-memory LRU after disconnect, and reconnecting with the same
-session ID continues turn numbering.
-
-## Failure behavior
-
-| Failure | Behavior |
+| Path | Responsibility |
 |---|---|
-| Invalid configuration | Startup fails with a concise validation error |
-| Malformed/unsupported event | Typed recoverable `error`; connection remains usable |
-| Fatal protocol violation | Best-effort fatal `error`, terminalize open turn, close `1008` |
-| Oversized input | Close `1009` without retaining the payload |
-| Inbound/lifecycle backpressure | Bounded queues remain bounded; an independent abort path closes `1013` even when the writer is stalled |
-| First-token/generation timeout | Invalidate unsent stream output and emit one `turn.failed` |
-| Provider error after visible output | Preserve written events, fence queued output, no replay, emit `turn.failed` |
-| Caller barge-in | Atomically interrupt/fence old turn, accept the same caller frame, reap cleanup separately |
-| Delayed provider cancellation | No late token reaches TTS/transport; new utterance endpointing continues |
-| Stop/disconnect/shutdown | Assign `session_ended` where transport permits and await all owned tasks within policy |
-| One load-call failure | Record the failure; other calls continue and remain isolated |
-
-Logs include session/turn lifecycle IDs and sanitized outcome categories. They
-exclude transcript, prompt, generated-token/chunk text, raw exception messages,
-and credential-bearing provider URLs.
+| [app/__main__.py](app/__main__.py) | Catalog/single-file startup and per-session runtime factory |
+| [app/api](app/api) | FastAPI routes, event schemas, WebSocket validation/transport |
+| [app/conversation](app/conversation) | Session ownership, turn lifecycle, concurrency, barge-in, writer |
+| [app/providers](app/providers) | Simulated STT, streaming mock LLM, sentence segmentation |
+| [app/scenario.py](app/scenario.py) | Strict scenario model and validated catalog loader |
+| [app/metrics.py](app/metrics.py) | Per-turn records and nearest-rank p50/p95 aggregation |
+| [client](client) | Scenario execution, ordered event observation, trace and report |
+| [load_test](load_test) | Seeded agent assignment, concurrent calls, and per-agent aggregation |
+| [scenarios](scenarios) | Deterministic interview fixtures |
+| [tests](tests) | Protocol, concurrency, failure, reporting, and load evidence |
 
 ## From simulation to production
 
-This assessment uses text chunks in place of audio, but the orchestration
-boundaries map directly to a real voice stack. The session state, turn IDs,
-cancellation, stale-output fencing, and metrics remain the same; only adapters
-and transport-specific buffer clearing change.
+The orchestration boundary is intentionally adapter-friendly:
 
-| Simulation | Production equivalent |
+| This project | Production equivalent |
 |---|---|
-| Text `audio.frame` events | PCM, Opus, or telephony audio frames |
-| Simulated partial/final transcripts | Deepgram streaming STT or a local Whisper streaming wrapper |
-| Streaming mock tokens | Hosted/local streaming LLM through `LLMProvider` |
-| Text `audio.chunk` events | Hosted streaming TTS or local Piper returning PCM/mu-law |
-| JSON WebSocket client | WebRTC media gateway or bidirectional SIP/Twilio stream |
+| Text in `audio.frame` | PCM/Opus or telephony audio from WebRTC, SIP, or Twilio Media Streams |
+| `SimulatedSTT` partial/final text | Deepgram streaming STT or Whisper streaming with VAD and transcript stabilization |
+| `MockLLMProvider` tokens | Hosted or local streaming LLM behind the same provider interface |
+| Text in `audio.chunk` | Streaming TTS audio, commonly PCM or mu-law for telephony |
+| JSON scripted caller | Browser/WebRTC client or bidirectional VoIP media gateway |
 
-Deepgram interim and endpointed transcripts map to the existing partial/final
-events. A local Whisper deployment adds VAD, rolling audio windows, and
-transcript-stability handling. A real TTS adapter consumes the same sentence
-stream and forwards audio bytes as soon as the provider returns them.
-Each provider request receives the configured system prompt, completed
-user/assistant history, turn ID, and session ID. Interrupted or failed partial
-answers are deliberately excluded from later context.
+Replacing adapters does not change the central responsibilities: session
+ownership, endpointing decisions, turn IDs, structured cancellation,
+stale-output fencing, one ordered writer, and latency measurement.
 
-For browser calls, WebRTC carries inbound/outbound media. For telephone calls,
-SIP or Twilio Media Streams connects to the same orchestrator. Production
-barge-in must also clear audio already buffered by the media transport; with
-Twilio this maps to its `clear` message. Pipecat or LiveKit could later replace
-the custom media/pipeline plumbing once demonstrating the underlying ownership
-and concurrency is no longer the assessment objective.
+## Verification
 
-Useful references:
+The full suite currently passes 102 async and synchronous tests. It covers
+scenario validation, protocol policy, explicit/silence endpointing, genuine
+LLM/TTS overlap, provider failure/timeouts, cancellation cleanup, bounded
+output, catalog selection, readable reporting, seeded load assignment,
+duplicate-session protection, stalled-writer shutdown, and load isolation.
 
-- [Deepgram live STT](https://developers.deepgram.com/reference/speech-to-text/listen-streaming)
-- [WhisperStreaming and SimulStreaming](https://github.com/ufal/whisper_streaming)
-- [Deepgram streaming TTS](https://developers.deepgram.com/reference/text-to-speech/speak-streaming)
-- [Piper local TTS](https://github.com/rhasspy/piper)
-- [Twilio Media Streams messages](https://www.twilio.com/docs/voice/media-streams/websocket-messages)
+The manually verified acceptance commands are:
 
-### Latency budget
+```bash
+python -m app --scenario-dir scenarios
+python -m client --scenario-file scenarios/ecommerce.json
+python -m load_test --scenario-dir scenarios --concurrency 20 --seed 42
+```
 
-The approximately 800 ms target means end of caller speech to first audible bot
-audio, not full-response completion. A reasonable p95 response-start budget is:
-
-| Stage | Budget |
-|---|---:|
-| Inbound transport handling | 30 ms |
-| Endpoint detection and final STT result | 180 ms |
-| Orchestration and prompt preparation | 20 ms |
-| LLM time to first token | 200 ms |
-| First speakable phrase accumulation | 80 ms |
-| TTS time to first audio byte | 150 ms |
-| Outbound transport and playout | 70 ms |
-| **Total** | **730 ms** |
-
-This is a target, not a guarantee for every provider/network. STT runs while the
-caller speaks; LLM generation, TTS, and playback overlap after the first phrase.
-Optimize endpointing first, then LLM TTFT, phrase-level TTS startup, and finally
-transport buffering/transcoding.
-
-In production, boundary spans and histograms would move to OpenTelemetry and
-Prometheus. Metrics labels must remain bounded (provider/model/outcome, not
-session IDs or text); durable per-call analytics can be exported asynchronously
-to a privacy-reviewed store. Alerts should separate endpointing, LLM, TTS, and
-transport regressions instead of relying only on total latency.
-
-## Known limitations
-
-- Text stands in for audio; there is no codec, jitter buffer, acoustic VAD,
-  echo cancellation, or actual media playout cancellation.
-- Metrics and session history are process-local bounded memory, not durable or
-  shared across workers.
-- The mock provider has deterministic canned responses; provider retry/fallback
-  is intentionally out of scope, and visible partial generations are never
-  replayed.
-- Authentication, authorization, quotas, TLS termination, multi-worker routing,
-  distributed tracing exporters, and production rate limiting are not included.
-- The load command demonstrates concurrency and isolation; it is not a capacity
-  benchmark and does not model real audio bandwidth.
-
-## Acceptance evidence
-
-The automated suite plus manual commands prove the design acceptance rows:
-
-| Acceptance | Evidence |
-|---|---|
-| AC-01 keyless run | `python -m app`; `python -m client --scenario default` |
-| AC-02/03 STT endpointing | `tests/test_stt.py`, `tests/test_session.py`, default CLI |
-| AC-04 true pipelining | `test_llm_production_overlaps_blocked_sentence_tts` |
-| AC-05/06/07 barge-in and fencing | `tests/test_barge_in.py`, barge-in CLI |
-| AC-08 delayed cancellation | `test_delayed_provider_cancellation_does_not_block_new_endpointing` |
-| AC-09 task cleanup | session/barge-in task-leak assertions and full `pytest -v` |
-| AC-10/18 protocol policy | `tests/test_api.py` recoverable/fatal/close-code cases |
-| AC-11/12/13 metrics | `tests/test_metrics_state.py`, session/API tests, `/metrics` curls |
-| AC-14 backpressure | outbound reservation tests and API overload close-`1013` test |
-| AC-15 concurrent isolation | `tests/test_load_test.py`; `python -m load_test` |
-| AC-16 closed-session metrics | registry/API tests and post-demo session query |
-| AC-17 session termination | manager shutdown and disconnect-during-terminal-send tests |
-
-## AI-tool disclosure
-
-AI-assisted coding was used to turn the approved design into incremental
-test-first implementation tasks, generate candidate code/tests, and perform a
-final review. Each task was executed sequentially: its tests were observed
-failing first, the smallest implementation was added, focused and full suites
-were run, and the result was committed independently. Concurrency behavior was
-validated with synchronization events and transport gates rather than accepted
-from generated code by inspection alone. No external audio/LLM service, secret,
-or private production data was used.
+Run the seeded load command twice to confirm the same per-agent assignment
+counts. Exact latency values depend on the machine and event-loop scheduling,
+so the runner reports measured p50/p95 rather than asserting fixed numbers.

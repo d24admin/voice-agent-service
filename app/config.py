@@ -4,7 +4,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, PositiveInt
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveInt
 
 
 class Settings(BaseModel):
@@ -15,22 +15,16 @@ class Settings(BaseModel):
     system_prompt: str = "You are a concise, helpful voice assistant."
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65_535)
-    stt_partial_delay_ms: PositiveInt = 20
+    stt_partial_delay_ms: NonNegativeInt = 20
     silence_timeout_ms: PositiveInt = 350
-    llm_token_delay_ms: PositiveInt = 40
-    tts_sentence_delay_ms: PositiveInt = 100
+    llm_token_delay_ms: NonNegativeInt = 40
+    tts_sentence_delay_ms: NonNegativeInt = 100
     first_token_timeout_ms: PositiveInt = 500
     generation_timeout_ms: PositiveInt = 5_000
-    cancellation_timeout_ms: PositiveInt = 250
-    backpressure_timeout_ms: PositiveInt = 250
     shutdown_grace_ms: PositiveInt = 1_000
     max_message_bytes: PositiveInt = 65_536
-    inbound_queue_size: PositiveInt = 64
     token_queue_size: PositiveInt = 32
-    outbound_data_capacity: PositiveInt = 128
-    outbound_lifecycle_capacity: PositiveInt = 16
-    metrics_session_capacity: PositiveInt = 200
-    metrics_turns_per_session: PositiveInt = 200
+    output_queue_size: PositiveInt = 128
 
     @classmethod
     def from_environment(

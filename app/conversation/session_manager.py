@@ -14,6 +14,9 @@ class SessionManager:
             raise ValueError(f"session already registered: {session.session_id}")
         self._sessions[session.session_id] = session
 
+    def contains(self, session_id: str) -> bool:
+        return session_id in self._sessions
+
     def unregister(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
 

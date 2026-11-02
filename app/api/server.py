@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket
@@ -22,6 +23,15 @@ from app.api.websocket_transport import (
 ProviderFactory = Callable[[str], LLMProvider]
 
 
+@dataclass(frozen=True, slots=True)
+class SessionRuntime:
+    settings: Settings
+    provider: LLMProvider
+
+
+RuntimeFactory = Callable[[str, str | None], SessionRuntime]
+
+
 class HealthResponse(BaseModel):
     status: str
     service: str
@@ -31,13 +41,13 @@ def create_app(
     settings: Settings | None = None,
     provider_factory: ProviderFactory | None = None,
     clock: Clock | None = None,
+    runtime_factory: RuntimeFactory | None = None,
 ) -> FastAPI:
+    if provider_factory is not None and runtime_factory is not None:
+        raise ValueError("provider_factory and runtime_factory are mutually exclusive")
     selected_settings = Settings() if settings is None else settings
     selected_clock = SystemClock() if clock is None else clock
-    registry = MetricsRegistry(
-        session_capacity=selected_settings.metrics_session_capacity,
-        turns_per_session=selected_settings.metrics_turns_per_session,
-    )
+    registry = MetricsRegistry()
     manager = SessionManager()
 
     if provider_factory is None:
@@ -86,15 +96,32 @@ def create_app(
         if not 1 <= len(session_id) <= 128:
             await websocket.close(code=1008)
             return
+        if manager.contains(session_id):
+            await websocket.close(code=1008)
+            return
+        if runtime_factory is None:
+            session_settings = selected_settings
+            provider = selected_provider_factory(session_id)
+        else:
+            try:
+                runtime = runtime_factory(
+                    session_id,
+                    websocket.query_params.get("scenario_id"),
+                )
+            except KeyError:
+                await websocket.close(code=1008)
+                return
+            session_settings = runtime.settings
+            provider = runtime.provider
         transport = WebSocketEventTransport(
             websocket,
-            max_message_bytes=selected_settings.max_message_bytes,
+            max_message_bytes=session_settings.max_message_bytes,
         )
         session = CallSession(
             session_id=session_id,
-            settings=selected_settings,
+            settings=session_settings,
             transport=transport,
-            provider=selected_provider_factory(session_id),
+            provider=provider,
             registry=registry,
             clock=selected_clock,
         )

@@ -36,16 +36,10 @@ def test_settings_defaults_are_assessment_safe() -> None:
     assert settings.tts_sentence_delay_ms == 100
     assert settings.first_token_timeout_ms == 500
     assert settings.generation_timeout_ms == 5000
-    assert settings.cancellation_timeout_ms == 250
-    assert settings.backpressure_timeout_ms == 250
     assert settings.shutdown_grace_ms == 1000
     assert settings.max_message_bytes == 65_536
-    assert settings.inbound_queue_size == 64
     assert settings.token_queue_size == 32
-    assert settings.outbound_data_capacity == 128
-    assert settings.outbound_lifecycle_capacity == 16
-    assert settings.metrics_session_capacity == 200
-    assert settings.metrics_turns_per_session == 200
+    assert settings.output_queue_size == 128
 
 
 def test_environment_overrides_defaults_with_typed_values() -> None:
@@ -68,7 +62,7 @@ def test_environment_overrides_defaults_with_typed_values() -> None:
     [
         ("VOICE_PORT", "0"),
         ("VOICE_SILENCE_TIMEOUT_MS", "-1"),
-        ("VOICE_INBOUND_QUEUE_SIZE", "0"),
+        ("VOICE_OUTPUT_QUEUE_SIZE", "0"),
         ("VOICE_MAX_MESSAGE_BYTES", "0"),
     ],
 )

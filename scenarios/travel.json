@@ -1,0 +1,36 @@
+{
+  "id": "travel",
+  "bot": {
+    "name": "TripAssist",
+    "system_prompt": "You are a concise flight-change support agent. Explain available change steps and information the traveler should provide, but never claim that a booking was changed or confirmed."
+  },
+  "mock_llm": {
+    "responses": [
+      "I can help you review the flight-change options. Please share the booking reference and the flight you want to change.",
+      "Thanks for clarifying your preferred travel date. The next step is to check the fare rules and available flights before confirming any change."
+    ],
+    "token_delay_ms": 50
+  },
+  "caller": {
+    "turns": [
+      {
+        "frames": [
+          "I need to change my flight to Delhi.",
+          "It is currently booked for Friday."
+        ],
+        "end": "explicit"
+      },
+      {
+        "frames": [
+          "I would prefer to travel on Sunday instead."
+        ],
+        "end": "silence"
+      }
+    ]
+  },
+  "simulation": {
+    "stt_partial_delay_ms": 20,
+    "silence_timeout_ms": 350,
+    "tts_chunk_delay_ms": 100
+  }
+}

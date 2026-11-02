@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from collections import OrderedDict, deque
 from collections.abc import Sequence
 from enum import Enum
 from typing import Any
@@ -28,7 +27,6 @@ class TurnMetrics(BaseModel):
     total_latency_ms: float | None = None
     token_count: int = 0
     audio_chunk_count: int = 0
-    terminal_delivered: bool = True
 
     def _elapsed_ms(self, now_ns: int) -> float:
         return max(0.0, (now_ns - self.baseline_ns) / 1_000_000)
@@ -44,7 +42,10 @@ class TurnMetrics(BaseModel):
         self.audio_chunk_count += 1
 
     def finalize(
-        self, outcome: TurnOutcome, reason: str | None, now_ns: int
+        self,
+        outcome: TurnOutcome,
+        reason: str | None,
+        now_ns: int,
     ) -> None:
         if self.total_latency_ms is not None:
             return
@@ -72,9 +73,9 @@ def _percentile_summary(values: Sequence[float]) -> dict[str, float | int | None
 
 
 class SessionMetrics:
-    def __init__(self, session_id: str, turn_capacity: int) -> None:
+    def __init__(self, session_id: str) -> None:
         self.session_id = session_id
-        self._turns: deque[TurnMetrics] = deque(maxlen=turn_capacity)
+        self._turns: list[TurnMetrics] = []
         self._started_ids: set[int] = set()
         self._recorded_ids: set[int] = set()
         self._counts = {
@@ -82,15 +83,6 @@ class SessionMetrics:
             "completed": 0,
             "interrupted": 0,
             "failed": 0,
-        }
-        self.timeout_count = 0
-        self.overload_count = 0
-        self.stale_event_drop_count = 0
-        self.queue_high_water = {
-            "inbound": 0,
-            "token": 0,
-            "outbound_data": 0,
-            "outbound_lifecycle": 0,
         }
 
     def mark_started(self, turn_id: int) -> None:
@@ -109,20 +101,9 @@ class SessionMetrics:
         self._counts[metrics.outcome.value] += 1
         self._turns.append(metrics.model_copy(deep=True))
 
-    def observe_queue(self, name: str, size: int) -> None:
-        if name not in self.queue_high_water:
-            raise ValueError(f"unknown queue metric: {name}")
-        self.queue_high_water[name] = max(self.queue_high_water[name], size)
-
-    @property
-    def next_turn_id(self) -> int:
-        return max(self._started_ids | self._recorded_ids, default=0) + 1
-
     def summary(self, *, include_turns: bool = True) -> dict[str, Any]:
         completed = [
-            turn
-            for turn in self._turns
-            if turn.outcome is TurnOutcome.COMPLETED and turn.terminal_delivered
+            turn for turn in self._turns if turn.outcome is TurnOutcome.COMPLETED
         ]
         result: dict[str, Any] = {
             "session_id": self.session_id,
@@ -140,13 +121,11 @@ class SessionMetrics:
                     if turn.total_latency_ms is not None
                 ]
             ),
-            "timeouts": self.timeout_count,
-            "overloads": self.overload_count,
-            "stale_event_drops": self.stale_event_drop_count,
-            "queue_high_water": dict(self.queue_high_water),
         }
         if include_turns:
-            result["turns"] = [turn.model_dump(mode="json") for turn in self._turns]
+            result["turns"] = [
+                turn.model_dump(mode="json") for turn in self._turns
+            ]
         return result
 
     @property
@@ -155,29 +134,22 @@ class SessionMetrics:
 
 
 class MetricsRegistry:
-    def __init__(self, session_capacity: int, turns_per_session: int) -> None:
-        if session_capacity <= 0 or turns_per_session <= 0:
-            raise ValueError("metrics capacities must be positive")
-        self._session_capacity = session_capacity
-        self._turns_per_session = turns_per_session
-        self._sessions: OrderedDict[str, SessionMetrics] = OrderedDict()
+    def __init__(self) -> None:
+        self._sessions: dict[str, SessionMetrics] = {}
+
+    def start_session(self, session_id: str) -> SessionMetrics:
+        session = SessionMetrics(session_id)
+        self._sessions[session_id] = session
+        return session
 
     def get_or_create(self, session_id: str) -> SessionMetrics:
         session = self._sessions.get(session_id)
         if session is None:
-            session = SessionMetrics(session_id, self._turns_per_session)
-            self._sessions[session_id] = session
-            while len(self._sessions) > self._session_capacity:
-                self._sessions.popitem(last=False)
-        else:
-            self._sessions.move_to_end(session_id)
+            session = self.start_session(session_id)
         return session
 
     def get(self, session_id: str) -> SessionMetrics | None:
-        session = self._sessions.get(session_id)
-        if session is not None:
-            self._sessions.move_to_end(session_id)
-        return session
+        return self._sessions.get(session_id)
 
     def summary(self, session_id: str | None = None) -> dict[str, Any] | None:
         if session_id is not None:
@@ -188,10 +160,13 @@ class MetricsRegistry:
             turn
             for session in self._sessions.values()
             for turn in session.turns
-            if turn.outcome is TurnOutcome.COMPLETED and turn.terminal_delivered
+            if turn.outcome is TurnOutcome.COMPLETED
         ]
         counts = {
-            key: sum(session.summary(include_turns=False)["counts"][key] for session in self._sessions.values())
+            key: sum(
+                session.summary(include_turns=False)["counts"][key]
+                for session in self._sessions.values()
+            )
             for key in ("started", "completed", "interrupted", "failed")
         }
         return {

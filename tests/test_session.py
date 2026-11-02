@@ -31,13 +31,9 @@ def settings(**overrides: int) -> Settings:
         "tts_sentence_delay_ms": 1,
         "first_token_timeout_ms": 100,
         "generation_timeout_ms": 500,
-        "cancellation_timeout_ms": 100,
-        "backpressure_timeout_ms": 100,
         "shutdown_grace_ms": 500,
-        "inbound_queue_size": 16,
         "token_queue_size": 8,
-        "outbound_data_capacity": 32,
-        "outbound_lifecycle_capacity": 4,
+        "output_queue_size": 32,
     }
     values.update(overrides)
     return Settings(**values)
@@ -49,7 +45,7 @@ def make_session(
     service_settings: Settings | None = None,
 ) -> tuple[CallSession, MetricsRegistry]:
     selected = settings() if service_settings is None else service_settings
-    registry = MetricsRegistry(session_capacity=8, turns_per_session=8)
+    registry = MetricsRegistry()
     provider = MockLLMProvider(
         responses=("Hi there. How are you?",),
         token_delay_s=selected.llm_token_delay_ms / 1_000,
@@ -206,3 +202,58 @@ async def test_writer_stamps_latency_only_after_transport_send_succeeds(
     assert getattr(turn.metrics, metric_name) is not None
     await stop(transport, task)
     assert live_session_tasks("session-1") == []
+
+
+@pytest.mark.asyncio
+async def test_stalled_writer_is_cancelled_when_shutdown_grace_expires() -> None:
+    transport = FakeTransport()
+    selected = settings(shutdown_grace_ms=10)
+    session, _ = make_session(transport, service_settings=selected)
+    task = asyncio.create_task(session.run())
+    await start(transport)
+    transport.block_on("llm.token")
+    await transport.inbound.put(AudioFrame(text="hello", **event_fields("frame")))
+    await transport.inbound.put(AudioEnd(**event_fields("end")))
+    await transport.wait_for_attempt("llm.token")
+
+    try:
+        await session.request_shutdown()
+        done, _ = await asyncio.wait({task}, timeout=0.1)
+        assert task in done
+        assert transport.close_code == 1000
+        assert live_session_tasks("session-1") == []
+    finally:
+        transport.release_sends()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_session_stop_cannot_block_before_timed_writer_cleanup() -> None:
+    transport = FakeTransport()
+    selected = settings(shutdown_grace_ms=10, output_queue_size=1)
+    session, _ = make_session(transport, service_settings=selected)
+    task = asyncio.create_task(session.run())
+    await start(transport)
+    transport.block_on("llm.token")
+    await transport.inbound.put(AudioFrame(text="hello", **event_fields("frame")))
+    await transport.inbound.put(AudioEnd(**event_fields("end")))
+    await transport.wait_for_attempt("llm.token")
+
+    async def wait_for_full_queue() -> None:
+        while session.output_queue_size < 1:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_full_queue(), timeout=0.1)
+    await transport.inbound.put(SessionStop(**event_fields("stop")))
+
+    try:
+        await asyncio.wait_for(task, timeout=0.1)
+        assert transport.close_code == 1000
+        assert live_session_tasks("session-1") == []
+    finally:
+        transport.release_sends()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

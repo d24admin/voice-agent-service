@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from app.conversation.outbound_buffer import LifecycleReservation
 from app.metrics import TurnMetrics, TurnOutcome
 
 __all__ = ["TurnOutcome", "TurnState"]
@@ -12,33 +11,28 @@ __all__ = ["TurnOutcome", "TurnState"]
 class TurnState:
     turn_id: int
     metrics: TurnMetrics
+    user_text: str = ""
     outcome: TurnOutcome = TurnOutcome.OPEN
     reason: str | None = None
-    generation_open: bool = True
-    playback_open: bool = True
     output_valid: bool = True
-    lifecycle_reservation: LifecycleReservation | None = None
-    user_text: str = ""
     response_tokens: list[str] = field(default_factory=list)
     history_committed: bool = False
 
+    def complete(self) -> bool:
+        return self._claim(TurnOutcome.COMPLETED, None, invalidate=False)
+
     def interrupt(self, reason: str) -> bool:
-        return self._claim_terminal(TurnOutcome.INTERRUPTED, reason, invalidate=True)
+        return self._claim(TurnOutcome.INTERRUPTED, reason, invalidate=True)
 
     def fail(self, reason: str) -> bool:
-        return self._claim_terminal(TurnOutcome.FAILED, reason, invalidate=True)
+        return self._claim(TurnOutcome.FAILED, reason, invalidate=True)
 
-    def mark_generation_finished(self) -> None:
-        self.generation_open = False
-
-    def complete_from_writer(self) -> bool:
-        if self.outcome is not TurnOutcome.OPEN or self.generation_open:
-            return False
-        self.playback_open = False
-        return self._claim_terminal(TurnOutcome.COMPLETED, None, invalidate=False)
-
-    def _claim_terminal(
-        self, outcome: TurnOutcome, reason: str | None, *, invalidate: bool
+    def _claim(
+        self,
+        outcome: TurnOutcome,
+        reason: str | None,
+        *,
+        invalidate: bool,
     ) -> bool:
         if self.outcome is not TurnOutcome.OPEN:
             return False

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,11 +14,15 @@ from app.clock import SystemClock
 from app.config import Settings
 from app.api.events import AudioEnd, AudioFrame, SessionStart, SessionStop
 from app.api.server import create_app
+from app.__main__ import build_catalog_runtime
 from app.metrics import TurnMetrics, TurnOutcome
 from app.providers.llm import ChatMessage
 from app.conversation.call_session import CallSession
 from app.conversation.session_manager import SessionManager
 from tests.conftest import FakeTransport, event_fields, live_session_tasks
+
+
+SCENARIOS = Path(__file__).parents[1] / "scenarios"
 
 
 def api_settings(**overrides: int) -> Settings:
@@ -28,15 +33,9 @@ def api_settings(**overrides: int) -> Settings:
         "tts_sentence_delay_ms": 1,
         "first_token_timeout_ms": 100,
         "generation_timeout_ms": 500,
-        "cancellation_timeout_ms": 100,
-        "backpressure_timeout_ms": 50,
         "shutdown_grace_ms": 200,
-        "inbound_queue_size": 16,
         "token_queue_size": 8,
-        "outbound_data_capacity": 32,
-        "outbound_lifecycle_capacity": 4,
-        "metrics_session_capacity": 8,
-        "metrics_turns_per_session": 8,
+        "output_queue_size": 32,
     }
     values.update(overrides)
     return Settings(**values)
@@ -168,26 +167,6 @@ def test_oversized_message_closes_1009() -> None:
             assert closed.value.code == 1009
 
 
-def test_inbound_overload_closes_1013() -> None:
-    app = create_app(
-        api_settings(
-            inbound_queue_size=1,
-            stt_partial_delay_ms=100,
-            backpressure_timeout_ms=5,
-        )
-    )
-    with TestClient(app) as client:
-        with client.websocket_connect("/ws/ws-1") as ws:
-            ws.send_json(payload("session.start"))
-            receive_until(ws, "session.ready")
-            for index in range(8):
-                ws.send_json(payload("audio.frame", event_id=f"f-{index}", text="word"))
-            with pytest.raises(WebSocketDisconnect) as closed:
-                while True:
-                    ws.receive_json()
-            assert closed.value.code == 1013
-
-
 def test_oversized_session_id_closes_1008() -> None:
     app = create_app(api_settings())
     with TestClient(app) as client:
@@ -195,6 +174,68 @@ def test_oversized_session_id_closes_1008() -> None:
             with client.websocket_connect(f"/ws/{'x' * 129}") as ws:
                 ws.receive_json()
         assert closed.value.code == 1008
+
+
+def test_scenario_query_selects_catalog_agent_and_default() -> None:
+    settings, runtime_factory = build_catalog_runtime(SCENARIOS)
+    app = create_app(settings, runtime_factory=runtime_factory)
+
+    def second_token(path: str, session_id: str) -> str:
+        with TestClient(app) as client:
+            with client.websocket_connect(path) as ws:
+                ws.send_json(payload("session.start", session_id=session_id))
+                receive_until(ws, "session.ready")
+                ws.send_json(
+                    payload("audio.frame", session_id=session_id, text="hello")
+                )
+                ws.send_json(payload("audio.end", session_id=session_id))
+                receive_until(ws, "llm.token")
+                token = receive_until(ws, "llm.token")["token"]
+                receive_until(ws, "turn.completed")
+                ws.send_json(payload("session.stop", session_id=session_id))
+                return token
+
+    assert second_token("/ws/default-agent", "default-agent") == "am"
+    assert second_token(
+        "/ws/travel-agent?scenario_id=travel", "travel-agent"
+    ) == "can"
+
+
+def test_unknown_scenario_closes_1008_without_creating_session_metrics() -> None:
+    settings, runtime_factory = build_catalog_runtime(SCENARIOS)
+    app = create_app(settings, runtime_factory=runtime_factory)
+
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as closed:
+            with client.websocket_connect(
+                "/ws/unknown-agent?scenario_id=missing"
+            ) as ws:
+                ws.receive_json()
+
+    assert closed.value.code == 1008
+    assert app.state.metrics.summary("unknown-agent") is None
+
+
+def test_duplicate_connection_does_not_replace_live_session_metrics() -> None:
+    app = create_app(api_settings())
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/ws-1") as first:
+            first.send_json(payload("session.start"))
+            receive_until(first, "session.ready")
+            first.send_json(payload("audio.frame", text="hello"))
+            first.send_json(payload("audio.end"))
+            receive_until(first, "turn.completed")
+
+            before = client.get("/metrics", params={"session_id": "ws-1"}).json()
+            with pytest.raises(WebSocketDisconnect) as rejected:
+                with client.websocket_connect("/ws/ws-1") as duplicate:
+                    duplicate.receive_json()
+            after = client.get("/metrics", params={"session_id": "ws-1"}).json()
+
+            assert rejected.value.code == 1008
+            assert before["counts"] == after["counts"]
+            assert after["counts"]["completed"] == 1
+            first.send_json(payload("session.stop"))
 
 
 @pytest.mark.asyncio
