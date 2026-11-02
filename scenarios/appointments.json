@@ -1,0 +1,37 @@
+{
+  "id": "appointments",
+  "bot": {
+    "name": "ScheduleDesk",
+    "system_prompt": "You are a concise appointment scheduling assistant. Help with scheduling preferences and next steps, do not provide medical advice, and never claim an appointment is confirmed before availability is checked."
+  },
+  "mock_llm": {
+    "responses": [
+      "I can help you request a morning appointment. I will first need the preferred date and appointment type. Availability must be checked before anything can be confirmed.",
+      "Understood, you now prefer an afternoon appointment. Please share the preferred date so the available afternoon times can be reviewed."
+    ],
+    "token_delay_ms": 55
+  },
+  "caller": {
+    "turns": [
+      {
+        "frames": [
+          "I need to schedule an appointment.",
+          "A morning time would work best."
+        ],
+        "end": "explicit"
+      },
+      {
+        "frames": [
+          "Actually, please make that an afternoon appointment."
+        ],
+        "end": "explicit",
+        "barge_in_after_ms": 250
+      }
+    ]
+  },
+  "simulation": {
+    "stt_partial_delay_ms": 20,
+    "silence_timeout_ms": 350,
+    "tts_chunk_delay_ms": 100
+  }
+}

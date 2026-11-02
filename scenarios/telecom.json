@@ -1,0 +1,35 @@
+{
+  "id": "telecom",
+  "bot": {
+    "name": "NetHelp",
+    "system_prompt": "You are a concise home-internet troubleshooting assistant. Guide the caller through safe diagnostic steps, but never claim a repair or escalation is complete."
+  },
+  "mock_llm": {
+    "responses": [
+      "I can help you narrow down the connection problem. First, please check whether the router power and internet lights are on.",
+      "A blinking internet light can indicate that the connection is still being established. Please restart the router once and wait for the lights to stabilize before the next check."
+    ],
+    "token_delay_ms": 45
+  },
+  "caller": {
+    "turns": [
+      {
+        "frames": [
+          "My home internet has stopped working."
+        ],
+        "end": "silence"
+      },
+      {
+        "frames": [
+          "The router power light is on, but the internet light is blinking."
+        ],
+        "end": "explicit"
+      }
+    ]
+  },
+  "simulation": {
+    "stt_partial_delay_ms": 20,
+    "silence_timeout_ms": 350,
+    "tts_chunk_delay_ms": 100
+  }
+}
