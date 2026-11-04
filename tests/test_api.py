@@ -104,6 +104,19 @@ def test_session_metrics_are_scoped_ordered_and_query_is_validated() -> None:
     assert invalid.status_code == 422
 
 
+def test_evicted_session_metrics_return_not_found() -> None:
+    app = create_app(api_settings())
+    for index in range(101):
+        app.state.metrics.start_session(f"session-{index}")
+
+    with TestClient(app) as client:
+        evicted = client.get("/metrics", params={"session_id": "session-0"})
+        retained = client.get("/metrics", params={"session_id": "session-100"})
+
+    assert evicted.status_code == 404
+    assert retained.status_code == 200
+
+
 def test_ping_and_recoverable_errors_leave_websocket_usable() -> None:
     app = create_app(api_settings())
     with TestClient(app) as client:

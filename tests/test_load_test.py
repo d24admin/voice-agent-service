@@ -281,7 +281,7 @@ def test_cli_supports_catalog_and_single_file_modes(
         )
         return await run_load(
             concurrency=1,
-            scenarios=(load_scenario(FIXTURE),),
+            scenarios=selected,  # type: ignore[arg-type]
             call_runner=lambda _url, _scenario, session_id: asyncio.sleep(
                 0, result=successful_result(session_id)
             ),
@@ -298,6 +298,17 @@ def test_cli_supports_catalog_and_single_file_modes(
             "1",
             "--seed",
             "7",
+        ]
+    ) == 0
+    gemini_fixture = SCENARIOS / "gemini" / "load-test.json"
+    assert main(
+        [
+            "--scenario-file",
+            str(gemini_fixture),
+            "--concurrency",
+            "1",
+            "--seed",
+            "11",
         ]
     ) == 0
     custom = tmp_path / "custom"
@@ -319,5 +330,6 @@ def test_cli_supports_catalog_and_single_file_modes(
     assert captured == [
         (["appointments", "ecommerce", "telecom", "travel"], 42),
         (["ecommerce"], 7),
+        (["ecommerce-gemini-load"], 11),
         (["travel"], 42),
     ]

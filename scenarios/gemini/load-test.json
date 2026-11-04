@@ -1,0 +1,26 @@
+{
+  "id": "ecommerce-gemini-load",
+  "bot": {
+    "name": "ShopHelp Gemini Load Test",
+    "system_prompt": "You are a concise ecommerce support agent. Give a brief, helpful answer about return options for a damaged order. Do not claim that a return or refund has been completed."
+  },
+  "mock_llm": {
+    "responses": ["Unused for Gemini load testing."],
+    "token_delay_ms": 0
+  },
+  "caller": {
+    "turns": [
+      {
+        "frames": [
+          "My order arrived damaged. What are my return options?"
+        ],
+        "end": "explicit"
+      }
+    ]
+  },
+  "simulation": {
+    "stt_partial_delay_ms": 20,
+    "silence_timeout_ms": 350,
+    "tts_chunk_delay_ms": 100
+  }
+}

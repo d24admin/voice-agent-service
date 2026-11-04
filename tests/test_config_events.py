@@ -40,6 +40,18 @@ def test_settings_defaults_are_assessment_safe() -> None:
     assert settings.max_message_bytes == 65_536
     assert settings.token_queue_size == 32
     assert settings.output_queue_size == 128
+    assert settings.llm_provider == "mock"
+    assert settings.llm_api_key is None
+    assert settings.llm_model == "gemini-3.5-flash-lite"
+    assert settings.llm_base_url == (
+        "https://generativelanguage.googleapis.com/v1beta"
+    )
+    assert settings.llm_max_retries == 1
+    assert settings.llm_retry_delay_ms == 250
+    assert settings.llm_failure_message == (
+        "I’m having trouble connecting right now. "
+        "Please try again in a moment."
+    )
 
 
 def test_environment_overrides_defaults_with_typed_values() -> None:
@@ -55,6 +67,63 @@ def test_environment_overrides_defaults_with_typed_values() -> None:
     assert settings.host == "0.0.0.0"
     assert settings.port == 9000
     assert settings.token_queue_size == 7
+
+
+def test_environment_loads_gemini_provider_settings() -> None:
+    settings = Settings.from_environment(
+        {
+            "VOICE_LLM_PROVIDER": "gemini",
+            "VOICE_LLM_API_KEY": "test-secret",
+            "VOICE_LLM_MODEL": "gemini-test",
+            "VOICE_LLM_BASE_URL": "https://example.test/v1beta/",
+            "VOICE_LLM_MAX_RETRIES": "2",
+            "VOICE_LLM_RETRY_DELAY_MS": "10",
+            "VOICE_LLM_FAILURE_MESSAGE": "Please call again.",
+        }
+    )
+
+    assert settings.llm_provider == "gemini"
+    assert settings.llm_api_key is not None
+    assert settings.llm_api_key.get_secret_value() == "test-secret"
+    assert settings.llm_model == "gemini-test"
+    assert settings.llm_base_url == "https://example.test/v1beta"
+    assert settings.llm_max_retries == 2
+    assert settings.llm_retry_delay_ms == 10
+    assert settings.llm_failure_message == "Please call again."
+
+
+def test_gemini_provider_requires_api_key() -> None:
+    with pytest.raises(ValidationError, match="VOICE_LLM_API_KEY"):
+        Settings.from_environment({"VOICE_LLM_PROVIDER": "gemini"})
+
+
+def test_gemini_provider_rejects_blank_api_key() -> None:
+    with pytest.raises(ValidationError, match="VOICE_LLM_API_KEY"):
+        Settings.from_environment(
+            {
+                "VOICE_LLM_PROVIDER": "gemini",
+                "VOICE_LLM_API_KEY": "   ",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("VOICE_LLM_PROVIDER", "unknown"),
+        ("VOICE_LLM_MODEL", "   "),
+        ("VOICE_LLM_BASE_URL", "not-a-url"),
+        ("VOICE_LLM_BASE_URL", "ftp://example.test/v1beta"),
+        ("VOICE_LLM_MAX_RETRIES", "-1"),
+        ("VOICE_LLM_MAX_RETRIES", "4"),
+        ("VOICE_LLM_FAILURE_MESSAGE", "  "),
+    ],
+)
+def test_settings_reject_invalid_llm_configuration(
+    name: str, value: str
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings.from_environment({name: value})
 
 
 @pytest.mark.parametrize(

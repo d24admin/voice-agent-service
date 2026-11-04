@@ -15,6 +15,9 @@ from app.scenario import (
 
 
 FIXTURE = Path(__file__).parents[1] / "scenarios" / "ecommerce.json"
+GEMINI_FIXTURE = (
+    Path(__file__).parents[1] / "scenarios" / "gemini" / "ecommerce.json"
+)
 
 
 def valid_payload() -> dict[str, object]:
@@ -52,8 +55,15 @@ def test_ecommerce_fixture_loads_with_interview_defaults() -> None:
     assert scenario.id == "ecommerce"
     assert scenario.mock_llm.token_delay_ms == 60
     assert scenario.caller.turns[0].end == "explicit"
-    assert scenario.caller.turns[1].barge_in_after_ms == 250
+    assert scenario.caller.turns[1].barge_in_after_ms == 50
     assert len(scenario.mock_llm.responses[0].split(".")) >= 4
+
+
+def test_nested_gemini_fixture_loads_with_live_barge_in_timing() -> None:
+    scenario = load_scenario(GEMINI_FIXTURE)
+
+    assert scenario.id == "ecommerce-gemini"
+    assert scenario.caller.turns[1].barge_in_after_ms == 100
 
 
 @pytest.mark.parametrize(

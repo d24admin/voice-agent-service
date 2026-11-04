@@ -175,6 +175,7 @@ async def test_delayed_provider_cancellation_does_not_block_new_endpointing() ->
     class SlowCancelProvider:
         def __init__(self) -> None:
             self.cancel_seen = asyncio.Event()
+            self.release_cleanup = asyncio.Event()
             self.cleanup_done = asyncio.Event()
 
         async def stream(
@@ -187,7 +188,7 @@ async def test_delayed_provider_cancellation_does_not_block_new_endpointing() ->
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
                     self.cancel_seen.set()
-                    await asyncio.sleep(0.02)
+                    await self.release_cleanup.wait()
                     yield "late-after-cancel"
                 finally:
                     self.cleanup_done.set()
@@ -211,27 +212,36 @@ async def test_delayed_provider_cancellation_does_not_block_new_endpointing() ->
     )
     await transport.inbound.put(AudioEnd(**event_fields("fresh-end")))
 
-    await transport.wait_for_sent("turn.interrupted")
-    assert provider.cancel_seen.is_set()
+    interrupted = await transport.wait_for_sent("turn.interrupted")
+    interruption_boundary = transport.sent.index(interrupted)
+    await asyncio.wait_for(provider.cancel_seen.wait(), timeout=1)
     await wait_until(
         lambda: any(
             isinstance(event, TranscriptFinal) and event.text == "fresh"
             for event in transport.sent
-        ),
-        timeout=0.05,
+        )
     )
-    await asyncio.wait_for(provider.cleanup_done.wait(), timeout=0.1)
-    assert not any(
-        isinstance(event, LLMToken) and event.token == "late-after-cancel"
-        for event in transport.sent
+    await wait_until(
+        lambda: any(
+            isinstance(event, LLMToken) and event.turn_id == 2
+            for event in transport.sent
+        )
     )
-
     await wait_until(
         lambda: any(
             isinstance(event, TurnCompleted) and event.turn_id == 2
             for event in transport.sent
         )
     )
+    assert not provider.cleanup_done.is_set()
+
+    provider.release_cleanup.set()
+    await asyncio.wait_for(provider.cleanup_done.wait(), timeout=1)
+    assert not any(
+        isinstance(event, (LLMToken, AudioChunk)) and event.turn_id == 1
+        for event in transport.sent[interruption_boundary + 1 :]
+    )
+
     await stop(transport, task)
     assert live_session_tasks("session-1") == []
 
