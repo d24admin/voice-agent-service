@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -8,8 +10,9 @@ from app.__main__ import (
     build_catalog_runtime,
     build_scenario_runtime,
     build_single_scenario_runtime,
+    main,
 )
-from app.providers.llm import ChatMessage
+from app.providers.llm import ChatMessage, GeminiLLMProvider
 
 
 FIXTURE = Path(__file__).parents[1] / "scenarios" / "ecommerce.json"
@@ -92,3 +95,58 @@ def test_single_scenario_runtime_accepts_only_matching_id() -> None:
     assert runtime_factory("two", "ecommerce").settings.llm_token_delay_ms == 60
     with pytest.raises(KeyError, match="travel"):
         runtime_factory("three", "travel")
+
+
+@pytest.mark.asyncio
+async def test_catalog_runtime_selects_fresh_gemini_provider_per_session() -> None:
+    settings, runtime_factory = build_catalog_runtime(
+        SCENARIOS,
+        environ={
+            "VOICE_LLM_PROVIDER": "gemini",
+            "VOICE_LLM_API_KEY": "test-secret",
+            "VOICE_LLM_MODEL": "gemini-test",
+            "VOICE_LLM_BASE_URL": "https://example.test/v1beta",
+            "VOICE_LLM_MAX_RETRIES": "0",
+            "VOICE_LLM_RETRY_DELAY_MS": "0",
+        },
+    )
+
+    first = runtime_factory("one", "ecommerce")
+    second = runtime_factory("two", "travel")
+    try:
+        assert settings.llm_provider == "gemini"
+        assert isinstance(first.provider, GeminiLLMProvider)
+        assert isinstance(second.provider, GeminiLLMProvider)
+        assert first.provider is not second.provider
+        assert first.settings.system_prompt.startswith("You are a concise ecommerce")
+        assert second.settings.system_prompt.startswith(
+            "You are a concise flight-change"
+        )
+    finally:
+        await first.provider.aclose()  # type: ignore[attr-defined]
+        await second.provider.aclose()  # type: ignore[attr-defined]
+
+
+def test_cli_loads_dotenv_without_overriding_process_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".env").write_text(
+        "VOICE_LLM_PROVIDER=gemini\n"
+        "VOICE_LLM_API_KEY=dotenv-secret\n"
+        "VOICE_LLM_MODEL=dotenv-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_run(app: object, *, host: str, port: int) -> None:
+        captured.update(app=app, host=host, port=port)
+
+    monkeypatch.setattr("app.__main__.uvicorn.run", fake_run)
+    with patch.dict(os.environ, {"VOICE_LLM_MODEL": "process-model"}, clear=True):
+        main(["--scenario-dir", str(SCENARIOS)])
+
+    settings = captured["app"].state.settings  # type: ignore[union-attr]
+    assert settings.llm_provider == "gemini"
+    assert settings.llm_api_key.get_secret_value() == "dotenv-secret"
+    assert settings.llm_model == "process-model"

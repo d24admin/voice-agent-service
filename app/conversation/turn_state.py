@@ -17,6 +17,7 @@ class TurnState:
     output_valid: bool = True
     response_tokens: list[str] = field(default_factory=list)
     history_committed: bool = False
+    terminal_claimed: bool = False
 
     def complete(self) -> bool:
         return self._claim(TurnOutcome.COMPLETED, None, invalidate=False)

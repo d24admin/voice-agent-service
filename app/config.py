@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveInt
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveInt,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 
 class Settings(BaseModel):
@@ -25,6 +35,48 @@ class Settings(BaseModel):
     max_message_bytes: PositiveInt = 65_536
     token_queue_size: PositiveInt = 32
     output_queue_size: PositiveInt = 128
+    llm_provider: Literal["mock", "gemini"] = "mock"
+    llm_api_key: SecretStr | None = None
+    llm_model: str = "gemini-3.5-flash-lite"
+    llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    llm_max_retries: int = Field(default=1, ge=0, le=3)
+    llm_retry_delay_ms: NonNegativeInt = 250
+    llm_failure_message: str = (
+        "I’m having trouble connecting right now. "
+        "Please try again in a moment."
+    )
+
+    @field_validator("llm_model", "llm_failure_message")
+    @classmethod
+    def _strip_non_empty_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+    @field_validator("llm_base_url")
+    @classmethod
+    def _validate_llm_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("LLM base URL must be an HTTP(S) URL without a query")
+        return normalized
+
+    @model_validator(mode="after")
+    def _require_gemini_api_key(self) -> Settings:
+        if self.llm_provider != "gemini":
+            return self
+        if self.llm_api_key is None or not self.llm_api_key.get_secret_value().strip():
+            raise ValueError(
+                "VOICE_LLM_API_KEY is required when VOICE_LLM_PROVIDER=gemini"
+            )
+        return self
 
     @classmethod
     def from_environment(

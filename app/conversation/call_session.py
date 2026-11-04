@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import uuid
 from dataclasses import dataclass
@@ -189,12 +190,14 @@ class CallSession:
                 for task in owned:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*owned, return_exceptions=True)
-                self._record_unwritten_turns()
                 try:
-                    await self._transport.close(self._requested_close_code)
+                    await asyncio.gather(*owned, return_exceptions=True)
                 finally:
-                    self._closed.set()
+                    self._record_unwritten_turns()
+                    try:
+                        await self._transport.close(self._requested_close_code)
+                    finally:
+                        self._closed.set()
             logger.info(
                 "session_closed session_id=%s close_code=%s",
                 self.session_id,
@@ -220,6 +223,7 @@ class CallSession:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*self._turn_tasks, return_exceptions=True)
+        await self._close_provider()
 
         if writer.done():
             await asyncio.gather(writer, return_exceptions=True)
@@ -403,9 +407,6 @@ class CallSession:
         outcome: TurnOutcome,
         reason: str | None,
     ) -> None:
-        if outcome is TurnOutcome.FAILED:
-            if not turn.fail(reason or "provider_error"):
-                return
         await self._output.put(_Terminal(turn.turn_id, outcome, reason))
 
     async def _interrupt_current(self, reason: str) -> TurnState | None:
@@ -469,12 +470,21 @@ class CallSession:
 
     async def _write_terminal(self, item: _Terminal) -> None:
         turn = self._turns[item.turn_id]
+        if turn.terminal_claimed:
+            return
         if item.outcome is TurnOutcome.COMPLETED:
             if not turn.complete():
+                return
+        elif item.outcome is TurnOutcome.FAILED:
+            if turn.outcome is TurnOutcome.OPEN:
+                if not turn.fail(item.reason or "provider_error"):
+                    return
+            elif turn.outcome is not TurnOutcome.FAILED:
                 return
         elif turn.outcome is not item.outcome:
             return
 
+        turn.terminal_claimed = True
         turn.metrics.finalize(turn.outcome, turn.reason, self._clock.monotonic_ns())
         terminal = self._terminal_event(turn)
         await self._transport.send(terminal)
@@ -529,6 +539,19 @@ class CallSession:
                     turn.outcome, turn.reason, self._clock.monotonic_ns()
                 )
             self._session_metrics.record_turn(turn.metrics)
+
+    async def _close_provider(self) -> None:
+        close = getattr(self._provider, "aclose", None)
+        if close is None:
+            return
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.warning(
+                "provider_cleanup_failed session_id=%s", self.session_id
+            )
 
     @staticmethod
     def _event_id() -> str:

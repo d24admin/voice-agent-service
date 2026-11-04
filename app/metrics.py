@@ -134,12 +134,17 @@ class SessionMetrics:
 
 
 class MetricsRegistry:
+    _MAX_SESSIONS = 100
+
     def __init__(self) -> None:
         self._sessions: dict[str, SessionMetrics] = {}
 
     def start_session(self, session_id: str) -> SessionMetrics:
         session = SessionMetrics(session_id)
+        self._sessions.pop(session_id, None)
         self._sessions[session_id] = session
+        while len(self._sessions) > self._MAX_SESSIONS:
+            self._sessions.pop(next(iter(self._sessions)))
         return session
 
     def get_or_create(self, session_id: str) -> SessionMetrics:

@@ -11,7 +11,7 @@ from app.config import Settings
 from app.conversation.turn_pipeline import ActiveTurnRunner
 from app.conversation.turn_state import TurnState
 from app.metrics import TurnMetrics, TurnOutcome
-from app.providers.llm import ChatMessage
+from app.providers.llm import ChatMessage, LLMProviderUnavailable
 
 
 def settings() -> Settings:
@@ -95,6 +95,7 @@ async def test_llm_keeps_producing_while_tts_handles_first_sentence() -> None:
 
 @pytest.mark.asyncio
 async def test_provider_failure_finishes_turn_once() -> None:
+    emitted: list[ServerEvent] = []
     finished: list[tuple[TurnOutcome, str | None]] = []
 
     class Provider:
@@ -108,7 +109,8 @@ async def test_provider_failure_finishes_turn_once() -> None:
             yield "visible"
             raise RuntimeError("secret provider detail")
 
-    async def emit(_event: ServerEvent, _turn: TurnState) -> bool:
+    async def emit(event: ServerEvent, _turn: TurnState) -> bool:
+        emitted.append(event)
         return True
 
     async def finish(
@@ -127,3 +129,58 @@ async def test_provider_failure_finishes_turn_once() -> None:
     ).run(turn(), (ChatMessage(role="user", content="hello"),))
 
     assert finished == [(TurnOutcome.FAILED, "provider_error")]
+    assert [event.token for event in emitted if isinstance(event, LLMToken)] == [
+        "visible"
+    ]
+    assert not any(isinstance(event, AudioChunk) for event in emitted)
+
+
+@pytest.mark.asyncio
+async def test_unavailable_provider_speaks_fallback_then_fails() -> None:
+    emitted: list[ServerEvent] = []
+    finished: list[tuple[TurnOutcome, str | None]] = []
+
+    class Provider:
+        async def stream(
+            self,
+            messages: Sequence[ChatMessage],
+            turn_id: int,
+            session_id: str | None = None,
+        ) -> AsyncIterator[str]:
+            del messages, turn_id, session_id
+            if False:
+                yield ""
+            raise LLMProviderUnavailable
+
+    async def emit(event: ServerEvent, _turn: TurnState) -> bool:
+        emitted.append(event)
+        return True
+
+    async def finish(
+        _turn: TurnState, outcome: TurnOutcome, reason: str | None
+    ) -> None:
+        finished.append((outcome, reason))
+
+    active = turn()
+    await ActiveTurnRunner(
+        provider=Provider(),
+        emit=emit,
+        finish=finish,
+        settings=settings(),
+        session_id="session-1",
+        clock=SystemClock(),
+        sleep=asyncio.sleep,
+    ).run(active, (ChatMessage(role="user", content="hello"),))
+
+    assert " ".join(
+        event.token for event in emitted if isinstance(event, LLMToken)
+    ) == (
+        "I’m having trouble connecting right now. "
+        "Please try again in a moment."
+    )
+    assert [event.text for event in emitted if isinstance(event, AudioChunk)] == [
+        "I’m having trouble connecting right now.",
+        "Please try again in a moment.",
+    ]
+    assert finished == [(TurnOutcome.FAILED, "provider_error")]
+    assert active.history_committed is False

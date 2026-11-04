@@ -11,7 +11,12 @@ from app.clock import Clock, SystemClock
 from app.config import Settings
 from app.conversation.turn_state import TurnState
 from app.metrics import TurnOutcome
-from app.providers.llm import ChatMessage, LLMProvider
+from app.providers.llm import (
+    ChatMessage,
+    LLMProvider,
+    LLMProviderError,
+    LLMProviderUnavailable,
+)
 from app.providers.tts import SentenceBuffer
 
 __all__ = ["ActiveTurnRunner"]
@@ -74,10 +79,16 @@ class ActiveTurnRunner:
         token_queue: asyncio.Queue[str | _EndOfStream] = asyncio.Queue(
             maxsize=self._settings.token_queue_size
         )
+        provider_unavailable = asyncio.Event()
         try:
             async with asyncio.TaskGroup() as group:
                 group.create_task(
-                    self._produce(turn, messages, token_queue),
+                    self._produce(
+                        turn,
+                        messages,
+                        token_queue,
+                        provider_unavailable,
+                    ),
                     name=f"turn-{turn.turn_id}-llm",
                 )
                 group.create_task(
@@ -93,19 +104,24 @@ class ActiveTurnRunner:
             return
 
         if turn.output_valid:
-            await self._finish(turn, TurnOutcome.COMPLETED, None)
+            if provider_unavailable.is_set():
+                await self._finish(turn, TurnOutcome.FAILED, "provider_error")
+            else:
+                await self._finish(turn, TurnOutcome.COMPLETED, None)
 
     async def _produce(
         self,
         turn: TurnState,
         messages: Sequence[ChatMessage],
         token_queue: asyncio.Queue[str | _EndOfStream],
+        provider_unavailable: asyncio.Event,
     ) -> None:
         try:
             stream = self._provider.stream(messages, turn.turn_id, self._session_id)
         except TypeError:
             stream = self._provider.stream(messages, turn.turn_id)
         iterator = aiter(stream)
+        published = False
         try:
             try:
                 async with asyncio.timeout(
@@ -114,8 +130,16 @@ class ActiveTurnRunner:
                     first = await self._first_token(iterator)
                     if first is not END_OF_STREAM:
                         await self._publish(turn, token_queue, first)
+                        published = True
                         async for token in iterator:
                             await self._publish(turn, token_queue, token)
+                            published = True
+            except LLMProviderUnavailable:
+                if published:
+                    raise LLMProviderError from None
+                provider_unavailable.set()
+                for token in self._settings.llm_failure_message.split():
+                    await self._publish(turn, token_queue, token)
             except _FirstTokenTimeout:
                 raise
             except TimeoutError as exc:

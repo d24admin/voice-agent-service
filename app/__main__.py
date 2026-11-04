@@ -5,10 +5,11 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import uvicorn
+from dotenv import load_dotenv
 
 from app.config import Settings
 from app.api.server import RuntimeFactory, SessionRuntime, create_app
-from app.providers.llm import LLMProvider, MockLLMProvider
+from app.providers.llm import GeminiLLMProvider, LLMProvider, MockLLMProvider
 from app.scenario import (
     InterviewScenario,
     ScenarioCatalog,
@@ -35,10 +36,22 @@ def _scenario_settings(base: Settings, scenario: InterviewScenario) -> Settings:
     )
 
 
-def _scenario_provider(scenario: InterviewScenario) -> MockLLMProvider:
-    return MockLLMProvider(
-        responses=scenario.mock_llm.responses,
-        token_delay_s=scenario.mock_llm.token_delay_ms / 1_000,
+def _scenario_provider(
+    settings: Settings, scenario: InterviewScenario
+) -> LLMProvider:
+    if settings.llm_provider == "mock":
+        return MockLLMProvider(
+            responses=scenario.mock_llm.responses,
+            token_delay_s=scenario.mock_llm.token_delay_ms / 1_000,
+        )
+    if settings.llm_api_key is None:
+        raise ValueError("Gemini provider requires an API key")
+    return GeminiLLMProvider(
+        api_key=settings.llm_api_key.get_secret_value(),
+        model=settings.llm_model,
+        base_url=settings.llm_base_url,
+        max_retries=settings.llm_max_retries,
+        retry_delay_s=settings.llm_retry_delay_ms / 1_000,
     )
 
 
@@ -51,9 +64,10 @@ def _runtime_factory(
         scenario_id: str | None,
     ) -> SessionRuntime:
         scenario = catalog.select(scenario_id)
+        settings = _scenario_settings(base, scenario)
         return SessionRuntime(
-            settings=_scenario_settings(base, scenario),
-            provider=_scenario_provider(scenario),
+            settings=settings,
+            provider=_scenario_provider(settings, scenario),
         )
 
     return create_runtime
@@ -69,7 +83,7 @@ def build_scenario_runtime(
     settings = _scenario_settings(base, scenario)
 
     def provider_factory(_session_id: str) -> LLMProvider:
-        return _scenario_provider(scenario)
+        return _scenario_provider(settings, scenario)
 
     return settings, provider_factory
 
@@ -97,6 +111,7 @@ def build_single_scenario_runtime(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    load_dotenv(".env", override=False)
     parser = argparse.ArgumentParser(description="Run the simulated voice service")
     scenarios = parser.add_mutually_exclusive_group()
     scenarios.add_argument(

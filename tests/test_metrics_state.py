@@ -83,6 +83,31 @@ def test_start_session_replaces_previous_run_for_same_id() -> None:
     assert registry.summary("session-1")["turns"] == []  # type: ignore[index]
 
 
+def test_registry_retains_only_100_most_recent_sessions() -> None:
+    registry = MetricsRegistry()
+
+    for index in range(101):
+        session = registry.start_session(f"session-{index}")
+        session.record_turn(completed_metrics(1, index + 1))
+
+    assert registry.get("session-0") is None
+    assert all(registry.get(f"session-{index}") is not None for index in range(1, 101))
+    assert registry.summary()["counts"]["completed"] == 100  # type: ignore[index]
+
+
+def test_replacing_session_moves_it_to_newest_retention_position() -> None:
+    registry = MetricsRegistry()
+    for index in range(100):
+        registry.start_session(f"session-{index}")
+
+    replaced = registry.start_session("session-0")
+    registry.start_session("session-100")
+
+    assert registry.get("session-0") is replaced
+    assert registry.get("session-1") is None
+    assert all(registry.get(f"session-{index}") is not None for index in range(2, 101))
+
+
 def test_nearest_rank_percentiles_are_deterministic() -> None:
     samples = [40.0, 10.0, 30.0, 20.0]
     assert nearest_rank(samples, 0.50) == 20.0

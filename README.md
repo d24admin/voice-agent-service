@@ -5,9 +5,11 @@ stand in for audio, but the difficult parts are real: partial and final STT,
 streaming LLM tokens, sentence-level TTS pipelining, caller interruption,
 bounded queues, task cancellation, event ordering, and latency measurement.
 
-No credentials, microphone, audio device, or external provider is required.
-The scenario catalog contains four deterministic agents; ecommerce remains the
-primary barge-in demonstration and default agent.
+The default mock provider requires no credentials, microphone, audio device,
+or external service. An optional Gemini adapter exercises the same streaming
+and interruption path with a real hosted model. The default catalog contains
+four deterministic mock agents; the separate Gemini fixture is excluded from
+catalog startup and load testing. Ecommerce remains the default agent.
 
 ## Review this project in five minutes
 
@@ -32,10 +34,14 @@ source .venv/bin/activate
 python -m client --scenario-file scenarios/ecommerce.json
 ```
 
-The trace demonstrates partial/final transcripts, word-by-word LLM output,
+Without `VOICE_LLM_PROVIDER=gemini` configured in the environment or `.env`,
+the service defaults to the deterministic mock provider. The trace demonstrates
+partial/final transcripts, word-by-word LLM output,
 TTS starting before generation finishes, and a guaranteed barge-in. The first
-bot answer is interrupted 250 ms after its first audio chunk; the second caller
-turn changes the request from replacement to refund.
+bot answer is interrupted 50 ms after its first audio chunk; the second caller
+turn changes the request from replacement to refund. Under the default mock
+configuration, these startup, client, and load-test commands use deterministic
+responses and make no provider requests.
 
 Then run the required 20-call load check and the test suite:
 
@@ -44,9 +50,15 @@ python -m load_test --scenario-dir scenarios --concurrency 20 --seed 42
 pytest -q
 ```
 
-The load command distributes calls reproducibly across the four agents. It
+The load command distributes calls reproducibly across the four mock agents. It
 reports requested/successful calls, unique sessions, actual peak concurrency,
 turn outcomes, and completed-turn p50/p95 latency overall and per agent.
+`load_test` connects to the already-running server and does not select its LLM
+provider. If `.env` was copied from `.env.example`, it selects Gemini; change
+`VOICE_LLM_PROVIDER` in `.env` to `mock` before starting the server for a
+deterministic load run. Leave it set to `gemini` only when intentionally
+load-testing the live provider, where provider latency, rate limits, and
+timeouts can cause calls or scripted barge-ins to fail.
 
 The shortest useful code-reading path is:
 
@@ -76,7 +88,7 @@ LLM     I am sorry your order arrived damaged.
 TTS ▶   “I am sorry your order arrived damaged.”
 LLM     I can help you review…
 
-⚡ BARGE-IN · turn 2 started 250 ms after first audio
+⚡ BARGE-IN · turn 2 started 50 ms after first audio
 RESULT  INTERRUPTED · barge_in
 LATENCY TTFT ... · TTFA ... · total ...
 ```
@@ -129,8 +141,8 @@ CallSession controller ──► simulated STT ──► final transcript
       │                              per-turn asyncio.TaskGroup
       │                              ┌─────────────────────────┐
       │                              │ LLM producer            │
-      │                              │       │ bounded tokens   │
-      │                              │       ▼                  │
+      │                              │       │ bounded tokens  │
+      │                              │       ▼                 │
       │                              │ sentence TTS consumer   │
       │                              └────────────┬────────────┘
       │                                           │
@@ -203,6 +215,14 @@ Terminal state is single-assignment, so a completion racing with an interrupt
 cannot produce two terminal events. The session still owns cancelled turn tasks
 and gathers remaining work during shutdown.
 
+The session cancels a turn as soon as caller speech arrives, but interruption
+is currently sentence-level in this text-audio simulation: each `audio.chunk`
+represents a complete sentence, so the demo cannot model cutting off audio
+mid-sentence. When the service moves to real audio, the TTS adapter should
+split synthesized audio into smaller chunks and stop playback or discard
+buffered chunks when caller speech arrives. That will support interruption at
+audio-chunk boundaries.
+
 ## Design choices and tradeoffs
 
 | Choice | Why | Tradeoff |
@@ -214,14 +234,16 @@ and gathers remaining work during shutdown.
 | One writer | Prevents concurrent socket writes and provides one ordering/metrics boundary | All outbound events share the same FIFO |
 | Cancellation plus turn-ID fencing | Prevents stale output even when a provider cleans up slowly | In-flight bytes already being sent cannot be recalled |
 | Fresh mock provider per session | Gives concurrent calls independent response cursors | Mock conversation state is not shared across reconnects |
+| Fresh Gemini provider per session | Reuses one HTTP client across a call and closes it with the session | Each call owns a separate connection pool |
+| Retry only before first output | Recovers one transient provider failure without duplicating caller-visible output | Failures after partial output terminate the turn without retry |
 | Strict shared scenario catalog | Server, client, and load runner share validated agent IDs | Server and runner must load matching catalogs |
 | Seeded random load assignment | Repeated runs exercise the same agent distribution | It is deterministic test randomness, not production routing |
 | Monotonic in-memory metrics | Produces reliable durations without infrastructure | Metrics reset when the process restarts |
 
 The assessment intentionally does not implement reconnect continuity,
-persistent metrics, real media, or external providers. Those are adapter and
-deployment concerns rather than prerequisites for demonstrating the core
-streaming and interruption behavior.
+persistent metrics, or real media. Gemini demonstrates the external-provider
+boundary; the remaining items are deployment concerns rather than
+prerequisites for demonstrating the core streaming and interruption behavior.
 
 ## Async task ownership
 
@@ -235,6 +257,7 @@ Every spawned task has an owner and an explicit cleanup path.
 | Turn task | Owns one bot response independently of caller input | Cancelled on barge-in/session end and tracked until done |
 | LLM producer | Streams provider tokens while TTS handles earlier text | Owned by the per-turn `TaskGroup` |
 | TTS consumer | Segments tokens and emits sentence audio | Owned by the same `TaskGroup`; sibling failure cancels it |
+| Gemini HTTP client | Reuses connections across turns in one call | Owned and closed by the `CallSession` provider lifecycle |
 | Client barge timer and receive | Keeps consuming server events during the configured delay | Losing task is cancelled; both are gathered in `finally` |
 | Load-call coroutines | Run isolated sessions concurrently | `gather(return_exceptions=True)` retrieves every result so one failure does not cancel siblings |
 
@@ -328,7 +351,7 @@ curl -fsS 'http://127.0.0.1:8000/metrics?session_id=<session-id>'
 
 ## Configurable interview scenarios
 
-The default `scenarios/` catalog contains:
+The default `scenarios/` catalog contains four deterministic mock scenarios:
 
 | ID | Agent | Demonstrates |
 |---|---|---|
@@ -370,6 +393,14 @@ python -m app --scenario-file scenarios/ecommerce.json
 The load runner accepts the same `--default-scenario-id` when exercising a
 custom catalog that does not contain ecommerce.
 
+The Gemini live barge-in fixture is stored at
+[`scenarios/gemini/ecommerce.json`](scenarios/gemini/ecommerce.json); the
+single-turn concurrency fixture is
+[`scenarios/gemini/load-test.json`](scenarios/gemini/load-test.json). Catalog
+and load-test catalog mode scan only JSON files directly inside `scenarios/`,
+so both fixtures are excluded from the default four-agent catalog and mock
+load test. Select either fixture explicitly with `--scenario-file`.
+
 Host, port, queue sizes, message limits, shutdown grace, and safety timeouts
 remain environment-owned:
 
@@ -384,6 +415,126 @@ server; infrastructure limits cannot be overridden by JSON. Programmatic
 `create_app()` remains available for focused tests or alternate provider
 factories without loading a scenario file.
 
+## Optional Gemini free-tier provider
+
+The default startup and load-test commands above use the mock provider unless
+Gemini is configured in the environment or `.env`. For a live Gemini call,
+create a key in
+[Google AI Studio](https://aistudio.google.com/app/apikey), copy the tracked
+template to the ignored local `.env`, and add the key there:
+
+```bash
+cp .env.example .env
+# Edit .env and set VOICE_LLM_API_KEY to the newly generated key.
+```
+
+The template sets `VOICE_LLM_PROVIDER=gemini` and the default model
+`gemini-3.5-flash-lite`. Local settings validation restricts the provider to
+`mock` or `gemini`, requires a nonblank model and API key for Gemini, and
+validates the base URL. Gemini confirms whether the key and model are accepted
+when the smoke request or live call is made. The server loads `.env` before
+settings are constructed. Existing exported process variables take
+precedence. `.env` is ignored by Git; keep credentials there or in environment
+variables, never in tracked files. Revoke and rotate a key immediately if it
+is exposed, then update the local `.env` value.
+
+Start the server in one terminal with the nested Gemini fixture:
+
+```bash
+source .venv/bin/activate
+VOICE_LLM_PROVIDER=gemini python -m app --scenario-file scenarios/gemini/ecommerce.json
+```
+
+Run the matching two-turn live caller from another terminal:
+
+```bash
+source .venv/bin/activate
+python -m client --scenario-file scenarios/gemini/ecommerce.json
+```
+
+For Gemini concurrency testing, keep the Gemini server running and use the
+load-test fixture explicitly. It uses one caller turn without a timed
+barge-in, so a fast response cannot make the call fail by completing before
+the interruption timer. Start a server for this fixture in one terminal:
+
+```bash
+VOICE_LLM_PROVIDER=gemini python -m app --scenario-file scenarios/gemini/load-test.json
+```
+
+Then run the load test from another terminal. This does not add Gemini to the
+default catalog or mock load test:
+
+```bash
+python -m load_test --scenario-file scenarios/gemini/load-test.json --concurrency 3 --seed 42
+```
+
+This sends live requests through the Gemini provider configured on the server.
+Start with low concurrency and increase it gradually; higher concurrency can
+hit provider rate limits or timeouts. Use
+`scenarios/gemini/ecommerce.json` with `python -m client` when you want to
+exercise its 100 ms Gemini barge-in behavior.
+
+The live fixture keeps its barge-in delay at 100 ms to exercise interruption
+while Gemini is generating. For a credential and streaming-endpoint smoke
+test, run this after creating `.env`; it sends a generic prompt and does not
+place the key in the command or tracked files:
+
+```bash
+set -a
+. ./.env
+set +a
+VOICE_LLM_BASE_URL="${VOICE_LLM_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}"
+curl -N -fsS \
+  -H "x-goog-api-key: ${VOICE_LLM_API_KEY}" \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: text/event-stream' \
+  "${VOICE_LLM_BASE_URL}/models/${VOICE_LLM_MODEL}:streamGenerateContent?alt=sse" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"Reply with the word OK."}]}]}'
+```
+
+`VOICE_LLM_BASE_URL` can replace the default base URL for a compatible test
+endpoint. The service applies a 500 ms first-token safety timeout and a 5 s
+generation timeout; `VOICE_FIRST_TOKEN_TIMEOUT_MS` and
+`VOICE_GENERATION_TIMEOUT_MS` change those values. The Gemini HTTP stream itself
+has no separate client timeout, so the service-level turn deadlines govern
+waiting for output.
+
+`gemini-3.5-flash-lite` is the documented default because it is currently
+available on the Gemini free tier and is optimized for cost-efficient work.
+Free-tier quotas, availability, and model names can change; verify the current
+[Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) before a demo.
+The base URL defaults to
+`https://generativelanguage.googleapis.com/v1beta` and can be overridden with
+`VOICE_LLM_BASE_URL` for a compatible test endpoint.
+
+The adapter retries one transient failure before any token is emitted, waiting
+250 ms by default. `VOICE_LLM_MAX_RETRIES` accepts `0` through `3`, and
+`VOICE_LLM_RETRY_DELAY_MS` changes the delay. Authentication and invalid-model
+errors are not retried. Once output starts, a provider error fails the turn
+without retry so callers never receive duplicated text or speech.
+
+An invalid/expired key or unavailable model produces an authentication or
+model error from the provider; those errors are not retried. A missing or blank
+key, blank model, or malformed base URL is rejected during local configuration
+validation. Rate limits and transient provider/network errors use the configured
+retry policy; if they persist, the turn emits the configured provider-failure
+message. A slow response can end in `first_token_timeout` or
+`generation_timeout`. A caller speaking during generation cancels the old
+turn and emits `turn.interrupted` with `reason="barge_in"`; the nested fixture
+deliberately tests this path at 100 ms.
+
+If Gemini remains unavailable before producing output, the service streams and
+speaks “I’m having trouble connecting right now. Please try again in a
+moment.”, then emits `turn.failed` with `reason="provider_error"`. Override the
+text with `VOICE_LLM_FAILURE_MESSAGE`. Because the turn failed, this message is
+not committed to successful conversation history.
+
+Gemini's free tier may use submitted prompts and generated responses to improve
+Google products. Do not send real customer PII, confidential material, secrets,
+or production conversations through this demo. Review the current
+[Gemini API terms](https://ai.google.dev/gemini-api/terms-archive/terms_02_05_25)
+before use.
+
 ## Repository tour
 
 | Path | Responsibility |
@@ -391,7 +542,7 @@ factories without loading a scenario file.
 | [app/__main__.py](app/__main__.py) | Catalog/single-file startup and per-session runtime factory |
 | [app/api](app/api) | FastAPI routes, event schemas, WebSocket validation/transport |
 | [app/conversation](app/conversation) | Session ownership, turn lifecycle, concurrency, barge-in, writer |
-| [app/providers](app/providers) | Simulated STT, streaming mock LLM, sentence segmentation |
+| [app/providers](app/providers) | Simulated STT, streaming mock and Gemini LLMs, sentence segmentation |
 | [app/scenario.py](app/scenario.py) | Strict scenario model and validated catalog loader |
 | [app/metrics.py](app/metrics.py) | Per-turn records and nearest-rank p50/p95 aggregation |
 | [client](client) | Scenario execution, ordered event observation, trace and report |
@@ -399,7 +550,7 @@ factories without loading a scenario file.
 | [scenarios](scenarios) | Deterministic interview fixtures |
 | [tests](tests) | Protocol, concurrency, failure, reporting, and load evidence |
 
-## From simulation to production
+## Production readiness and safety boundaries
 
 The orchestration boundary is intentionally adapter-friendly:
 
@@ -407,7 +558,7 @@ The orchestration boundary is intentionally adapter-friendly:
 |---|---|
 | Text in `audio.frame` | PCM/Opus or telephony audio from WebRTC, SIP, or Twilio Media Streams |
 | `SimulatedSTT` partial/final text | Deepgram streaming STT or Whisper streaming with VAD and transcript stabilization |
-| `MockLLMProvider` tokens | Hosted or local streaming LLM behind the same provider interface |
+| `MockLLMProvider` tokens | `GeminiLLMProvider` today; other hosted or local streaming adapters can use the same interface |
 | Text in `audio.chunk` | Streaming TTS audio, commonly PCM or mu-law for telephony |
 | JSON scripted caller | Browser/WebRTC client or bidirectional VoIP media gateway |
 
@@ -415,12 +566,81 @@ Replacing adapters does not change the central responsibilities: session
 ownership, endpointing decisions, turn IDs, structured cancellation,
 stale-output fencing, one ordered writer, and latency measurement.
 
+### Scale and reliability
+
+This assessment is intentionally single-process and in-memory. A production
+deployment would also need to:
+
+- export bounded-cardinality service and turn metrics through OpenTelemetry
+  collectors and a Prometheus scrape endpoint instead of relying on the
+  in-process registry;
+- authenticate callers and services, enforce tenant-aware rate limits and
+  quotas, and reject unauthenticated WebSocket upgrades;
+- scale horizontally behind a load balancer that keeps each live WebSocket on
+  one worker, with external coordination when reconnects or cross-node
+  continuity are required;
+- retain the existing retry-before-first-output rule while adding provider
+  circuit breakers, deadlines, load shedding, and queue-based backpressure;
+- store conversation state in a bounded external store only when reconnects
+  must resume a call, rather than assuming process-local `CallSession` state;
+- send structured logs to a centralized system and propagate trace context
+  across the media gateway, orchestration service, and external providers;
+- load credentials from a managed secret store, rotate them, and keep them out
+  of source control, client-visible errors, logs, and traces;
+- replace text frames with PCM/Opus or telephony media, streaming STT/TTS, and
+  a production voice-activity detector with measured endpointing behavior; and
+- define session retention and eviction explicitly, using bounded TTL/LRU
+  policies in memory or lifecycle policies in the external state store.
+
+### Safety and guardrails
+
+The current assessment already uses strict event and scenario schemas,
+message-size limits, bounded queues, provider timeouts, and sanitized lifecycle
+logging that excludes transcripts and provider secrets. Its scenario prompts
+also avoid claiming that a refund, booking change, or appointment was completed
+when the service cannot perform that action.
+
+Those controls are not a complete production safety layer. A production
+service would additionally need to:
+
+- treat caller transcripts, retrieved content, and provider output as
+  untrusted input; isolate system instructions and test prompt-injection and
+  instruction-conflict cases;
+- minimize PII collection, redact it from logs and traces, encrypt it in
+  transit and at rest, and enforce tenant-specific retention and deletion
+  policies;
+- moderate caller input and generated text/audio before it is delivered or
+  used to invoke another system;
+- enforce authenticated tenant boundaries on session state, metrics, traces,
+  provider credentials, and any future tool results;
+- allowlist tools and actions, validate their parameters, and authorize each
+  invocation against the caller's and tenant's scopes;
+- detect abuse and apply per-identity and per-tenant rate limits, quotas, and
+  escalation or blocking policies; and
+- require explicit user confirmation, action-specific authorization,
+  idempotency controls, and an audit record before consequential operations
+  such as issuing a refund or changing a booking.
+
+This assessment does not execute external tools or consequential actions; it
+only explains the next step a production integration could take.
+
+## Use of AI tools
+
+- Used OpenAI Codex for architecture discussion, concurrency analysis, test
+  refinement, and documentation review.
+- Manually reviewed the changed implementation and traced cancellation,
+  provider, metrics, and configuration paths.
+- Ran the relevant focused tests and the full local test suite.
+- Verified the documented startup, client, metrics, load-test, and Gemini
+  smoke-test workflows locally.
+- Kept credentials out of tracked documentation and source files.
+
 ## Verification
 
-The full suite currently passes 102 async and synchronous tests. It covers
-scenario validation, protocol policy, explicit/silence endpointing, genuine
-LLM/TTS overlap, provider failure/timeouts, cancellation cleanup, bounded
-output, catalog selection, readable reporting, seeded load assignment,
+The full suite covers scenario validation, protocol policy, explicit/silence
+endpointing, genuine LLM/TTS overlap, Gemini request mapping and retries,
+spoken provider-failure handling, cancellation cleanup, bounded output,
+catalog selection, readable reporting, seeded load assignment,
 duplicate-session protection, stalled-writer shutdown, and load isolation.
 
 The manually verified acceptance commands are:

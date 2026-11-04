@@ -1,0 +1,35 @@
+{
+  "id": "ecommerce-gemini",
+  "bot": {
+    "name": "ShopHelp Gemini",
+    "system_prompt": "You are a concise ecommerce support agent. Help customers with damaged orders, replacement options, and refunds. Ask only for information needed for the next step and never claim an action was completed when it was not."
+  },
+  "mock_llm": {
+    "responses": ["Unused for Gemini"],
+    "token_delay_ms": 0
+  },
+  "caller": {
+    "turns": [
+      {
+        "frames": [
+          "Hi, my order arrived damaged.",
+          "I would like to know my replacement options."
+        ],
+        "end": "explicit"
+      },
+      {
+        "frames": [
+          "Actually, I no longer want a replacement.",
+          "I want a refund instead."
+        ],
+        "end": "explicit",
+        "barge_in_after_ms": 100
+      }
+    ]
+  },
+  "simulation": {
+    "stt_partial_delay_ms": 20,
+    "silence_timeout_ms": 350,
+    "tts_chunk_delay_ms": 100
+  }
+}

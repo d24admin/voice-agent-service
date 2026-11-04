@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator, Sequence
 
 import pytest
 
@@ -16,9 +17,15 @@ from app.api.events import (
     TranscriptFinal,
     TranscriptPartial,
     TurnCompleted,
+    TurnFailed,
 )
 from app.metrics import MetricsRegistry
-from app.providers.llm import MockLLMProvider
+from app.providers.llm import (
+    ChatMessage,
+    LLMProviderError,
+    LLMProviderUnavailable,
+    MockLLMProvider,
+)
 from app.conversation.call_session import CallSession
 from tests.conftest import FakeTransport, event_fields, live_session_tasks
 
@@ -118,6 +125,63 @@ async def test_scripted_call_streams_ordered_stt_llm_tts_and_metrics() -> None:
     }
     assert transport.close_code == 1000
     assert live_session_tasks("session-1") == []
+
+
+@pytest.mark.asyncio
+async def test_provider_exhaustion_speaks_fallback_fails_and_closes_provider() -> None:
+    class UnavailableProvider:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def stream(
+            self,
+            messages: list[ChatMessage],
+            turn_id: int,
+            session_id: str | None = None,
+        ) -> object:
+            del messages, turn_id, session_id
+            if False:
+                yield ""
+            raise LLMProviderUnavailable
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    transport = FakeTransport()
+    provider = UnavailableProvider()
+    registry = MetricsRegistry()
+    session = CallSession(
+        session_id="session-1",
+        settings=settings(),
+        transport=transport,
+        provider=provider,
+        registry=registry,
+        clock=SystemClock(),
+    )
+    task = asyncio.create_task(session.run())
+    await start(transport)
+    await transport.inbound.put(AudioFrame(text="hello", **event_fields("frame")))
+    await transport.inbound.put(AudioEnd(**event_fields("end")))
+
+    failed = await transport.wait_for_sent("turn.failed")
+    await stop(transport, task)
+
+    assert isinstance(failed, TurnFailed)
+    assert failed.reason == "provider_error"
+    assert " ".join(
+        event.token for event in transport.sent if isinstance(event, LLMToken)
+    ) == settings().llm_failure_message
+    assert [
+        event.text for event in transport.sent if isinstance(event, AudioChunk)
+    ] == [
+        "I’m having trouble connecting right now.",
+        "Please try again in a moment.",
+    ]
+    assert session.turns[1].history_committed is False
+    assert provider.closed is True
+    summary = registry.summary("session-1")
+    assert summary is not None
+    assert summary["counts"]["failed"] == 1
 
 
 @pytest.mark.asyncio
@@ -257,3 +321,120 @@ async def test_session_stop_cannot_block_before_timed_writer_cleanup() -> None:
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_competing_provider_and_protocol_failures_emit_one_terminal() -> None:
+    class PartialFailureProvider:
+        async def stream(
+            self,
+            messages: Sequence[ChatMessage],
+            turn_id: int,
+            session_id: str | None = None,
+        ) -> AsyncIterator[str]:
+            del messages, turn_id, session_id
+            yield "Partial"
+            raise LLMProviderError
+
+    transport = FakeTransport()
+    session, _ = make_session(transport)
+    session._provider = PartialFailureProvider()
+    task = asyncio.create_task(session.run())
+    await start(transport)
+    transport.block_on("llm.token")
+    await transport.inbound.put(AudioFrame(text="hello", **event_fields("frame")))
+    await transport.inbound.put(AudioEnd(**event_fields("end")))
+    await transport.wait_for_attempt("llm.token")
+
+    async def competing_failures_are_queued() -> None:
+        while session.output_queue_size < 3:
+            await asyncio.sleep(0)
+
+    await transport.inbound.put(SessionStart(**event_fields("duplicate-start")))
+    await asyncio.wait_for(competing_failures_are_queued(), timeout=0.1)
+    transport.release_sends()
+    await asyncio.wait_for(task, timeout=1)
+
+    failed = [event for event in transport.sent if isinstance(event, TurnFailed)]
+    assert len(failed) == 1
+    assert failed[0].reason == "session_aborted"
+
+
+@pytest.mark.asyncio
+async def test_blocking_provider_close_is_bounded_by_shutdown_grace() -> None:
+    class BlockingCloseProvider:
+        def __init__(self) -> None:
+            self.close_started = asyncio.Event()
+            self.close_cancelled = asyncio.Event()
+
+        async def stream(
+            self,
+            messages: Sequence[ChatMessage],
+            turn_id: int,
+            session_id: str | None = None,
+        ) -> AsyncIterator[str]:
+            del messages, turn_id, session_id
+            if False:
+                yield ""
+
+        async def aclose(self) -> None:
+            self.close_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.close_cancelled.set()
+
+    transport = FakeTransport()
+    session, _ = make_session(
+        transport,
+        service_settings=settings(shutdown_grace_ms=10),
+    )
+    provider = BlockingCloseProvider()
+    session._provider = provider
+    task = asyncio.create_task(session.run())
+    await start(transport)
+
+    await session.request_shutdown()
+    await asyncio.wait_for(task, timeout=0.1)
+    await asyncio.wait_for(session.wait_closed(), timeout=0.1)
+
+    assert provider.close_started.is_set()
+    assert provider.close_cancelled.is_set()
+    assert transport.close_code == 1000
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_provider_close_still_finalizes_session() -> None:
+    class BlockingCloseProvider:
+        def __init__(self) -> None:
+            self.close_started = asyncio.Event()
+
+        async def stream(
+            self,
+            messages: Sequence[ChatMessage],
+            turn_id: int,
+            session_id: str | None = None,
+        ) -> AsyncIterator[str]:
+            del messages, turn_id, session_id
+            if False:
+                yield ""
+
+        async def aclose(self) -> None:
+            self.close_started.set()
+            await asyncio.Event().wait()
+
+    transport = FakeTransport()
+    session, _ = make_session(transport)
+    provider = BlockingCloseProvider()
+    session._provider = provider
+    task = asyncio.create_task(session.run())
+    await start(transport)
+
+    await session.request_shutdown()
+    await asyncio.wait_for(provider.close_started.wait(), timeout=0.1)
+    session.force_cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(session.wait_closed(), timeout=0.1)
+
+    assert transport.close_code == 1000
